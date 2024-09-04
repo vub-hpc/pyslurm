@@ -24,12 +24,12 @@ def get_version():
     with (TOPDIR / "pyslurm/__version__.py").open() as f:
         for line in f.read().splitlines():
             if line.startswith("__version__"):
-               return Version(line.split('"')[1])
+               return str(line.split('"')[1])
     raise RuntimeError("Cannot get version string.")
 
 
 VERSION = get_version()
-SLURM_VERSION = f"{VERSION.major}.{VERSION.minor}"
+SLURM_VERSION = '.'.join(VERSION.split('.')[:2])
 
 
 def homepage(*args):
