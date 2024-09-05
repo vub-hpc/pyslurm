@@ -5,7 +5,7 @@
 
 Name:           python-pyslurm
 Version:        %{slurm_version}.0^%{snapshot}
-Release:        1%{?dist}
+Release:        1.bx%{?dist}
 Summary:        Python Interface to Slurm
 
 License:        GPL-2.0
