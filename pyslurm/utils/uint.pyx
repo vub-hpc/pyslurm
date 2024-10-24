@@ -178,10 +178,6 @@ cdef u16_set_bool_flag(uint16_t *flags, boolean, true_flag, false_flag=0):
 cdef u32_set_bool_flag(uint32_t *flags, boolean, true_flag, false_flag=0):
     flags[0] = uint_set_bool_flag(flags[0], boolean, true_flag, false_flag)
 
-cdef u32_set_bool_flag(uint32_t *flags, boolean, true_flag, false_flag=0):
-    flags[0] = uint_set_bool_flag(flags[0], boolean, true_flag, false_flag)
-
-
 cdef u64_set_bool_flag(uint64_t *flags, boolean, true_flag, false_flag=0):
     flags[0] = uint_set_bool_flag(flags[0], boolean, true_flag, false_flag)
 
