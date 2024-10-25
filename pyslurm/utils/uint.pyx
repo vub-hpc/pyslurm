@@ -142,7 +142,7 @@ cdef uint_parse_bool_flag(flags, flag, no_val):
 
 cdef uint_parse_bool(val, no_val):
     if not val or val == no_val:
-        return False 
+        return False
 
     return True
 
