@@ -1,11 +1,11 @@
 %global slurm_version 24.05
-%global slurm_patch 4
-%global commit 29994adfc7a2bc74f69b54c5e381ea3d2dd32752
-%global snapshot 1.git29994
+%global slurm_patch 7
+%global commit 46c0d75b078253e84bb621f693c87be2e725b204
+%global snapshot 1.git46c0d
 
 Name:           python-pyslurm
 Version:        %{slurm_version}.0^%{snapshot}
-Release:        1.bx%{?dist}
+Release:        2.bx%{?dist}
 Summary:        Python Interface to Slurm
 
 License:        GPL-2.0
