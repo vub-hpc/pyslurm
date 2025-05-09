@@ -1,6 +1,6 @@
 %global slurm_version 24.05
 %global slurm_patch 8
-%global commit 29994adfc7a2bc74f69b54c5e381ea3d2dd32752
+%global commit c8ce3a4b3be693bb70a3d5dfc06f6a06d2dece63
 %global snapshot 1.git29994
 
 Name:           python-pyslurm
