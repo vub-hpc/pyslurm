@@ -1,5 +1,5 @@
 %global slurm_version 24.05
-%global slurm_patch 4
+%global slurm_patch 8
 %global commit 29994adfc7a2bc74f69b54c5e381ea3d2dd32752
 %global snapshot 1.git29994
 
