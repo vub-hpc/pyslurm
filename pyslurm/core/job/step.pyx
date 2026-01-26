@@ -26,7 +26,7 @@ from typing import Union
 from pyslurm.utils import cstr, ctime
 from pyslurm.utils.uint import *
 from pyslurm.core.error import RPCError, verify_rpc
-from pyslurm.settings import LOCAL_CLUSTER
+from pyslurm import settings
 from pyslurm import xcollections
 from pyslurm.utils.helpers import (
     signal_to_num,
@@ -34,8 +34,8 @@ from pyslurm.utils.helpers import (
     uid_to_name,
     humanize_step_id,
     dehumanize_step_id,
+    cpu_freq_int_to_str,
 )
-from pyslurm.core.job.util import cpu_freq_int_to_str
 from pyslurm.utils.ctime import (
     secs_to_timestr,
     mins_to_timestr,
@@ -107,10 +107,11 @@ cdef class JobSteps(dict):
         cdef:
             JobStep step
             uint32_t cnt = 0
+            slurm_step_id_t step_id = init_step_id()
             dict steps = {}
 
-        rc = slurm_get_job_steps(<time_t>0, job_id, slurm.NO_VAL, &self.info,
-                                 flags)
+        step_id.job_id = job_id
+        rc = slurm_get_job_steps(&step_id, &self.info, flags)
         verify_rpc(rc)
 
         # zero-out a dummy job_step_info_t
@@ -157,7 +158,9 @@ cdef class JobStep:
         self._alloc_impl()
         self.job_id = job_id.id if isinstance(job_id, Job) else job_id
         self.id = step_id
-        cstr.fmalloc(&self.ptr.cluster, LOCAL_CLUSTER)
+        self.stats = JobStepStatistics()
+        self.pids = {}
+        cstr.fmalloc(&self.ptr.cluster, settings.LOCAL_CLUSTER)
 
         # Initialize attributes, if any were provided
         for k, v in kwargs.items():
@@ -188,6 +191,9 @@ cdef class JobStep:
 
     def _dealloc_impl(self):
         slurm_free_job_step_info_members(self.ptr)
+        # Bug in slurm_free_job_step_info_members - submit_line is not freed
+        # there.
+        xfree(self.ptr.submit_line)
         xfree(self.ptr)
         slurm_free_update_step_msg(self.umsg)
         self.umsg = NULL
@@ -220,8 +226,8 @@ cdef class JobStep:
             (pyslurm.JobStep): Returns a new JobStep instance
 
         Raises:
-            RPCError: When retrieving Step information from the slurmctld was
-                not successful.
+            (pyslurm.RPCError): When retrieving Step information from the
+                slurmctld was not successful.
 
         Examples:
             >>> import pyslurm
@@ -230,10 +236,11 @@ cdef class JobStep:
         cdef:
             job_step_info_response_msg_t *info = NULL
             JobStep wrap = None
+            slurm_step_id_t _step_id = init_step_id()
 
-        job_id = job_id.id if isinstance(job_id, Job) else job_id
-        rc = slurm_get_job_steps(<time_t>0, job_id, dehumanize_step_id(step_id),
-                                       &info, slurm.SHOW_ALL)
+        _step_id.job_id = job_id.id if isinstance(job_id, Job) else job_id
+        _step_id.step_id = dehumanize_step_id(step_id)
+        rc = slurm_get_job_steps(&_step_id, &info, slurm.SHOW_ALL)
         verify_rpc(rc)
 
         if info and info.job_step_count == 1:
@@ -251,8 +258,37 @@ cdef class JobStep:
     cdef JobStep from_ptr(job_step_info_t *in_ptr):
         cdef JobStep wrap = JobStep.__new__(JobStep)
         wrap._alloc_info()
+        wrap.stats = JobStepStatistics()
+        wrap.pids = {}
         memcpy(wrap.ptr, in_ptr, sizeof(job_step_info_t))
         return wrap
+
+    def load_stats(self):
+        """Load realtime stats for this Step.
+
+        Calling this function returns the live statistics of the step, and
+        additionally populates the `stats` and `pids` attribute of the
+        instance.
+
+        Returns:
+            (pyslurm.db.JobStepStatistics): The statistics of the Step.
+
+        Raises:
+            (pyslurm.RPCError): When retrieving the stats for the Step failed.
+
+        Examples:
+            >>> import pyslurm
+            >>> step = pyslurm.JobStep.load(9999, 1)
+            >>> stats = step.load_stats()
+            >>>
+            >>> # Print the CPU Time Used
+            >>> print(stats.total_cpu_time)
+            >>>
+            >>> # Print the Process-IDs for the Step, organized by hostname
+            >>> print(step.pids)
+        """
+        stats.load_single(self)
+        return self.stats
 
     def send_signal(self, signal):
         """Send a signal to a running Job step.
@@ -265,7 +301,7 @@ cdef class JobStep:
                 a str like `SIGUSR1`, or simply an [int][].
 
         Raises:
-            RPCError: When sending the signal was not successful.
+            (pyslurm.RPCError): When sending the signal was not successful.
 
         Examples:
             Specifying the signal as a string:
@@ -277,9 +313,8 @@ cdef class JobStep:
 
             >>> pyslurm.JobStep(9999, 1).send_signal(9)
         """
-        step_id = self.ptr.step_id.step_id
         sig = signal_to_num(signal)
-        verify_rpc(slurm_signal_job_step(self.job_id, step_id, sig))
+        verify_rpc(slurm_signal_job_step(&self.ptr.step_id, sig))
 
     def cancel(self):
         """Cancel a Job step.
@@ -287,14 +322,13 @@ cdef class JobStep:
         Implements the slurm_kill_job_step RPC.
 
         Raises:
-            RPCError: When cancelling the Job was not successful.
+            (pyslurm.RPCError): When cancelling the Job was not successful.
 
         Examples:
             >>> import pyslurm
             >>> pyslurm.JobStep(9999, 1).cancel()
         """
-        step_id = self.ptr.step_id.step_id
-        verify_rpc(slurm_kill_job_step(self.job_id, step_id, 9, 0))
+        verify_rpc(slurm_kill_job_step(&self.ptr.step_id, 9, 0))
 
     def modify(self, JobStep changes):
         """Modify a job step.
@@ -308,7 +342,7 @@ cdef class JobStep:
                 properties can be modified.
 
         Raises:
-            RPCError: When updating the JobStep was not successful.
+            (pyslurm.RPCError): When updating the JobStep was not successful.
 
         Examples:
             >>> import pyslurm
@@ -319,8 +353,7 @@ cdef class JobStep:
         """
         cdef JobStep js = <JobStep>changes
         js._alloc_umsg()
-        js.umsg.step_id = self.ptr.step_id.step_id
-        js.umsg.job_id = self.ptr.step_id.job_id
+        js.umsg.step_id = self.ptr.step_id
         verify_rpc(slurm_update_step(js.umsg))
 
     def as_dict(self):
@@ -338,6 +371,8 @@ cdef class JobStep:
         if dist:
             out["distribution"] = dist.to_dict()
 
+        out["stats"] = self.stats.to_dict()
+        out["pids"] = self.pids
         return out
 
     @property
@@ -422,7 +457,19 @@ cdef class JobStep:
 
     @property
     def run_time(self):
-        return _raw_time(self.ptr.run_time)
+        return _raw_time(self.ptr.run_time, on_noval=0, on_inf=0)
+
+    @property
+    def run_time_remaining(self):
+        limit = self.time_limit
+        if limit is None:
+            return None
+
+        return (limit*60) - self.run_time
+
+    @property
+    def elapsed_cpu_time(self):
+        return self.run_time * self.cpus
 
     @property
     def partition(self):
@@ -433,12 +480,12 @@ cdef class JobStep:
         return cstr.to_unicode(slurm_job_state_string(self.ptr.state))
 
     @property
-    def alloc_cpus(self):
-        return u32_parse(self.ptr.num_cpus)
+    def cpus(self):
+        return u32_parse(self.ptr.num_cpus, on_noval=1)
 
     @property
     def ntasks(self):
-        return u32_parse(self.ptr.num_tasks)
+        return u32_parse(self.ptr.num_tasks, on_noval=1)
 
     @property
     def distribution(self):

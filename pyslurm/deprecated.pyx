@@ -1,0 +1,4373 @@
+# cython: profile=False
+# cython: language_level=3
+# cython: auto_pickle=False
+import os
+import re
+import sys
+import time as p_time
+
+from socket import gethostname
+from collections import defaultdict
+from pwd import getpwnam, getpwuid
+
+from libc.errno cimport errno, EAGAIN
+from libc.stddef cimport size_t
+from libc.stdint cimport uint8_t, uint16_t, uint32_t
+from libc.stdint cimport int64_t, uint64_t
+from libc.stdlib cimport malloc, free
+from libc.string cimport strlen, strcpy, memset, memcpy
+from posix.unistd cimport getuid, getgid
+from cpython cimport bool
+
+cdef extern from 'stdio.h':
+    ctypedef struct FILE
+    cdef FILE *stdout
+
+cdef extern from 'Python.h':
+    cdef FILE *PyFile_AsFile(object file)
+
+cdef extern from 'time.h' nogil:
+    ctypedef long time_t
+    double difftime(time_t time1, time_t time2)
+    time_t time(time_t *t)
+
+cdef extern from "sys/wait.h" nogil:
+    int WIFSIGNALED(int status)
+    int WTERMSIG(int status)
+    int WEXITSTATUS(int status)
+    int WIFEXITED(int status)
+
+cdef extern from "<sys/types.h>" nogil:
+    ctypedef long id_t
+
+cdef extern from "<sys/resource.h>" nogil:
+    enum: PRIO_PROCESS
+    int getpriority(int, id_t)
+
+#cdef extern from *:
+#    # deprecated backwards compatibility declaration
+#    ctypedef char*  const_char_ptr  "const char*"
+#    ctypedef char** const_char_pptr "const char**"
+
+cdef extern from "alps_cray.h" nogil:
+    cdef int ALPS_CRAY_SYSTEM
+
+import builtins as __builtin__
+
+from pyslurm cimport slurm
+from pyslurm.slurm cimport xmalloc
+import pyslurm.core.job
+
+include "pydefines/slurm_errno_defines.pxi"
+include "pydefines/slurm_errno_enums.pxi"
+
+include "pydefines/slurm_defines.pxi"
+include "pydefines/slurm_enums.pxi"
+
+include "pydefines/slurmdb_defines.pxi"
+include "pydefines/slurmdb_enums.pxi"
+
+#
+# Slurm Macros as Cython inline functions
+#
+
+cdef inline SLURM_VERSION_NUMBER():
+    return slurm.SLURM_VERSION_NUMBER
+
+cdef inline SLURM_VERSION_MAJOR(a):
+    return ((a >> 16) & 0xff)
+
+cdef inline SLURM_VERSION_MINOR(a):
+    return ((a >> 8) & 0xff)
+
+cdef inline SLURM_VERSION_MICRO(a):
+    return (a & 0xff)
+
+cdef inline SLURM_VERSION_NUM(a):
+    return (((SLURM_VERSION_MAJOR(a)) << 16) +
+            ((SLURM_VERSION_MINOR(a)) << 8) +
+            (SLURM_VERSION_MICRO(a)))
+
+DEF MAX_RETRIES = 15
+
+# SLURM_ID_HASH
+# Description:
+#   Creates a hash of a Slurm JOBID and STEPID
+#   The JOB STEP ID is in the top 32 bits of the hash with the job id occupying
+#   the lower 32 bits.
+#
+#   IN  _jobid -- SLURM's JOB ID (uint32_t)
+#   IN  _stepid -- SLURM's JOB STEP ID (uint32_t)
+#   RET id_hash -- (uint64_t)
+
+
+cdef inline SLURM_ID_HASH(_jobid, _stepid):
+    return <uint64_t>(<uint64_t>_stepid << 32 + _jobid)
+
+cdef inline SLURM_ID_HASH_JOB_ID(hash_id):
+    return <uint32_t>(hash_id & 0x00000000FFFFFFFF)
+
+cdef inline SLURM_ID_HASH_STEP_ID(hash_id):
+    return <uint32_t>(hash_id >> 32)
+
+
+# Convert a hash ID to its legacy (pre-17.11) equivalent
+# Used for backward compatibility for Cray PMI
+
+cdef inline SLURM_ID_HASH_LEGACY(hash_id):
+    return ((hash_id >> 32) * 10000000000 + (hash_id & 0x00000000FFFFFFFF))
+
+
+# Helpers
+cdef inline listOrNone(char* value, sep_char):
+    if value is NULL:
+        return []
+
+    if not sep_char:
+        return value.decode("UTF-8", "replace")
+
+    if sep_char == '':
+        return value.decode("UTF-8", "replace")
+
+    return value.decode("UTF_8", "replace").split(sep_char)
+
+cdef inline listOfStrings(char **value):
+    l = []
+    i = 0
+    if value != NULL:
+        while value[i] != NULL:
+            l.append(stringOrNone(value[i], ''))
+            i += 1
+
+    return(tuple(l))
+
+cdef inline stringOrNone(char* value, value2):
+    if value is NULL:
+        if value2 is '':
+            return None
+        return value2
+    return value.decode("UTF-8", "replace")
+
+
+cdef inline int16orNone(uint16_t value):
+    if value is NO_VAL16:
+        return None
+    else:
+        return value
+
+
+cdef inline int32orNone(uint32_t value):
+    if value is NO_VAL:
+        return None
+    else:
+        return value
+
+
+cdef inline int64orNone(uint64_t value):
+    if value is NO_VAL64:
+        return None
+    else:
+        return value
+
+
+cdef inline int16orUnlimited(uint16_t value, return_type):
+    if value is INFINITE16:
+        if return_type is "int":
+            return None
+        else:
+            return "UNLIMITED"
+    else:
+        if return_type is "int":
+            return value
+        else:
+            return str(value)
+
+
+#
+# Defined job states
+#
+
+cdef inline IS_JOB_PENDING(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_PENDING)
+
+cdef inline IS_JOB_RUNNING(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_RUNNING)
+
+cdef inline IS_JOB_SUSPENDED(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_SUSPENDED)
+
+cdef inline IS_JOB_COMPLETE(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_COMPLETE)
+
+cdef inline IS_JOB_CANCELLED(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_CANCELLED)
+
+cdef inline IS_JOB_FAILED(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_FAILED)
+
+cdef inline IS_JOB_TIMEOUT(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_TIMEOUT)
+
+cdef inline IS_JOB_NODE_FAILED(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_NODE_FAIL)
+
+cdef inline IS_JOB_DEADLINE(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_DEADLINE)
+
+cdef inline IS_JOB_OOM(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) == JOB_OOM)
+
+cdef inline IS_JOB_POWERING_UP_NODE(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_STATE_BASE)
+
+#
+# Derived job states
+#
+
+cdef inline IS_JOB_COMPLETING(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_COMPLETING)
+
+cdef inline IS_JOB_CONFIGURING(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_CONFIGURING)
+
+cdef inline IS_JOB_STARTED(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) > JOB_PENDING)
+
+cdef inline IS_JOB_FINISHED(slurm.slurm_job_info_t _X):
+    return ((_X.job_state & JOB_STATE_BASE) > JOB_SUSPENDED)
+
+cdef inline IS_JOB_COMPLETED(slurm.slurm_job_info_t _X):
+    return (IS_JOB_FINISHED(_X) and ((_X.job_state & JOB_COMPLETING) == 0))
+
+cdef inline IS_JOB_RESIZING(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_RESIZING)
+
+cdef inline IS_JOB_REQUEUED(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_REQUEUE)
+
+cdef inline IS_JOB_FED_REQUEUED(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_REQUEUE_FED)
+
+cdef inline IS_JOB_REVOKED(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_REVOKED)
+
+cdef inline IS_JOB_SIGNALING(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_SIGNALING)
+
+cdef inline IS_JOB_STAGE_OUT(slurm.slurm_job_info_t _X):
+    return (_X.job_state & JOB_STAGE_OUT)
+
+#
+# Defined node states
+#
+
+cdef inline IS_NODE_UNKNOWN(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_BASE) == NODE_STATE_UNKNOWN
+
+cdef inline IS_NODE_DOWN(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_BASE) == NODE_STATE_DOWN
+
+cdef inline IS_NODE_IDLE(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_BASE) == NODE_STATE_IDLE
+
+cdef inline IS_NODE_ALLOCATED(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_BASE) == NODE_STATE_ALLOCATED
+
+cdef inline IS_NODE_ERROR(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_BASE) == NODE_STATE_ERROR
+
+cdef inline IS_NODE_MIXED(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_BASE) == NODE_STATE_MIXED
+
+cdef inline IS_NODE_FUTURE(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_BASE) == NODE_STATE_FUTURE
+
+#
+# Derived node states
+#
+
+cdef inline IS_NODE_CLOUD(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_CLOUD)
+
+cdef inline IS_NODE_DRAIN(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_DRAIN)
+
+cdef inline IS_NODE_DRAINING(slurm.node_info_t _X):
+    return ((_X.node_state & NODE_STATE_DRAIN) and
+            (IS_NODE_ALLOCATED(_X) or IS_NODE_MIXED(_X)))
+
+cdef inline IS_NODE_DRAINED(slurm.node_info_t _X):
+    return (IS_NODE_DRAIN(_X) and not IS_NODE_DRAINING(_X))
+
+cdef inline IS_NODE_COMPLETING(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_COMPLETING)
+
+cdef inline IS_NODE_NO_RESPOND(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_NO_RESPOND)
+
+cdef inline IS_NODE_POWERED_DOWN(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_POWERED_DOWN)
+
+cdef inline IS_NODE_POWERING_DOWN(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_POWERING_DOWN)
+
+cdef inline IS_NODE_FAIL(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_FAIL)
+
+cdef inline IS_NODE_POWERING_UP(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_POWERING_UP)
+
+cdef inline IS_NODE_MAINT(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_MAINT)
+
+cdef inline IS_NODE_REBOOT_REQUESTED(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_REBOOT_REQUESTED)
+
+cdef inline IS_NODE_REBOOT_ISSUED(slurm.node_info_t _X):
+    return (_X.node_state & NODE_STATE_REBOOT_ISSUED)
+
+ctypedef struct config_key_pair_t:
+    char *name
+    char *value
+
+
+#
+# Cython Wrapper Functions
+#
+
+
+def get_controllers():
+    """Get information about slurm controllers.
+
+    Returns:
+        (tuple): Name of primary controller, Name of backup controllers
+    """
+    cdef:
+        slurm.slurm_conf_t *slurm_ctl_conf_ptr = NULL
+        slurm.time_t Time = <slurm.time_t>NULL
+        int apiError = 0
+        int errCode = slurm.slurm_load_ctl_conf(Time, &slurm_ctl_conf_ptr)
+        uint32_t length = 0
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    control_machs = []
+    if slurm_ctl_conf_ptr is not NULL:
+
+        if slurm_ctl_conf_ptr.control_machine is not NULL:
+            length = slurm_ctl_conf_ptr.control_cnt
+            for index in range(length):
+                primary = stringOrNone(slurm_ctl_conf_ptr.control_machine[index], '')
+                control_machs.append(primary)
+
+        slurm.slurm_free_ctl_conf(slurm_ctl_conf_ptr)
+
+    return control_machs
+
+
+def is_controller(Host=None):
+    """Return slurm controller status for host.
+
+    Args:
+        Host (str): Name of host to check
+
+    Returns:
+        (str): None, "primary" or "backup"
+    """
+    control_machs = get_controllers()
+    if not Host:
+        Host = gethostname()
+
+    index = control_machs.index(Host)
+    if index == -1:
+        return None
+    if index == 0:
+        return 'primary'
+    if index > 0:
+        return 'backup'
+
+
+def slurm_api_version():
+    """Return the slurm API version number.
+
+    Returns:
+        (tuple): A tuple of version_major, version_minor, version_micro
+    """
+    cdef long version = slurm.SLURM_VERSION_NUMBER
+
+    return (SLURM_VERSION_MAJOR(version),
+            SLURM_VERSION_MINOR(version),
+            SLURM_VERSION_MICRO(version))
+
+
+def slurm_load_slurmd_status():
+    """Issue RPC to get and load the status of Slurmd daemon.
+
+    Returns:
+        (str): Slurmd information
+    """
+    cdef:
+        dict Status = {}, Status_dict = {}
+        slurm.slurmd_status_t *slurmd_status = NULL
+        int errCode = slurm.slurm_load_slurmd_status(&slurmd_status)
+
+    if errCode == slurm.SLURM_SUCCESS:
+        hostname = stringOrNone(slurmd_status.hostname, '')
+        Status_dict['actual_boards'] = slurmd_status.actual_boards
+        Status_dict['booted'] = slurmd_status.booted
+        Status_dict['actual_cores'] = slurmd_status.actual_cores
+        Status_dict['actual_cpus'] = slurmd_status.actual_cpus
+        Status_dict['actual_real_mem'] = slurmd_status.actual_real_mem
+        Status_dict['actual_sockets'] = slurmd_status.actual_sockets
+        Status_dict['actual_threads'] = slurmd_status.actual_threads
+        Status_dict['actual_tmp_disk'] = slurmd_status.actual_tmp_disk
+        Status_dict['hostname'] = hostname
+        Status_dict['last_slurmctld_msg'] = slurmd_status.last_slurmctld_msg
+        Status_dict['pid'] = slurmd_status.pid
+        Status_dict['slurmd_debug'] = slurmd_status.slurmd_debug
+        Status_dict['slurmd_logfile'] = stringOrNone(slurmd_status.slurmd_logfile, '')
+        Status_dict['step_list'] = stringOrNone(slurmd_status.step_list, '')
+        Status_dict['version'] = stringOrNone(slurmd_status.version, '')
+
+        Status[hostname] = Status_dict
+
+    slurm.slurm_free_slurmd_status(slurmd_status)
+
+    return Status
+
+#
+# Slurm Config Class
+#
+
+def get_private_data_list(data):
+    """Retrieve the enciphered Private Data configuration.
+
+    Returns:
+        (list): Private data
+    """
+
+    result = []
+    exponent = 7
+    types = ['jobs', 'node', 'partitions', 'usage', 'users', 'accounts', 'reservations', 'cloud_nodes']
+    preview = data
+    rest = data
+    while rest != 0:
+        rest = data % pow(2, exponent)
+        if rest != preview:
+            result.append(types[exponent])
+        exponent = exponent - 1
+        preview = rest
+    return result
+
+# Slurm Ping/Reconfig/Shutdown functions
+#
+
+
+cpdef int slurm_ping(int Controller=0) except? -1:
+    """Issue RPC to check if slurmctld is responsive.
+
+    Args:
+        Controller (int, optional): 0 for primary (Default=0), 1 for backup, 2
+            for backup2, ...
+
+    Returns:
+        0 for success or slurm error code
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_ping(Controller)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_reconfigure() except? -1:
+    """Issue RPC to have slurmctld reload its configuration file.
+
+    Returns:
+        0 for success or slurm error code
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_reconfigure()
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_shutdown(uint16_t Options=0) except? -1:
+    """Issue RPC to have slurmctld cease operations.
+
+    Both the primary and backup controller are shutdown.
+
+    Args:
+        Options (int, optional):
+            0 - All slurm daemons (default)
+            1 - slurmctld generates a core file
+            2 - slurmctld is shutdown (no core file)
+
+    Returns:
+        int: 0 for success or slurm error code
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_shutdown(Options)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_takeover(int backup_inx) except? -1:
+    """Issue a RPC to have slurmctld backup controller take over.
+
+    The backup controller takes over the primary controller.
+
+    Returns:
+        int: 0 for success or slurm error code
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_takeover(backup_inx)
+
+    return errCode
+
+
+cpdef int slurm_set_debug_level(uint32_t DebugLevel=0) except? -1:
+    """Set the slurm controller debug level.
+
+    Args:
+        DebugLevel (int, optional): The debug level. Possible values are from
+            0 to 6.
+
+    Returns:
+        int: 0 for success, -1 for error and set slurm error number
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_set_debug_level(DebugLevel)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_set_debugflags(uint32_t debug_flags_plus=0,
+                               uint32_t debug_flags_minus=0) except? -1:
+    """Set the slurm controller debug flags.
+
+    Args:
+        debug_flags_plus (int, optional): Debug flags to be added.
+        debug_flags_minus (int, optional): Debug flags to be removed.
+
+    Returns:
+        int: 0 for success, -1 for error and set slurm error number
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_set_debugflags(debug_flags_plus,
+                                                  debug_flags_minus)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_set_schedlog_level(uint32_t Enable=0) except? -1:
+    """Set the slurm scheduler debug level.
+
+    Args:
+        Enable (int, optional): True = 0, False = 1
+
+    Returns:
+        int: 0 for success, -1 for error and set the slurm error number
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_set_schedlog_level(Enable)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+#
+# Slurm Job Suspend Functions
+#
+
+
+cpdef int slurm_suspend(uint32_t JobID=0) except? -1:
+    """Suspend a running slurm job.
+
+    Args:
+        JobID (int): The job id.
+
+    Returns:
+        int: 0 for success or slurm error code
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_suspend(JobID)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_resume(uint32_t JobID=0) except? -1:
+    """ Resume a running slurm job step.
+
+    Args:
+        JobID (int): The job id.
+
+    Returns:
+        int: 0 for success or slurm error code
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_resume(JobID)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_requeue(uint32_t JobID=0, uint32_t State=0) except? -1:
+    """Requeue a running slurm job step.
+
+    Args:
+        JobID (int): The job id.
+
+    Returns:
+        int: 0 for success or slurm error code
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_requeue(JobID, State)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef long slurm_get_rem_time(uint32_t JobID=0) except? -1:
+    """Get the remaining time in seconds for a slurm job step.
+
+    Args:
+        JobID (int): The job id.
+
+    Returns:
+        int: Remaining time in seconds or -1 on error
+    """
+    cdef int apiError = 0
+    cdef long errCode = slurm.slurm_get_rem_time(JobID)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef time_t slurm_get_end_time(uint32_t JobID=0) except? -1:
+    """Get the end time in seconds for a slurm job step.
+
+    Args:
+        JobID (int): The job id.
+
+    Returns:
+        int: Remaining time in seconds or -1 on error
+    """
+    cdef time_t EndTime = -1
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_get_end_time(JobID, &EndTime)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return EndTime
+
+
+cpdef int slurm_job_node_ready(uint32_t JobID=0) except? -1:
+    """Return if a node could run a slurm job now if dispatched.
+
+    Args:
+        JobID (int): The job id.
+
+    Returns:
+        int: Node ready code.
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_job_node_ready(JobID)
+
+    return errCode
+
+
+cpdef int slurm_signal_job(uint32_t JobID=0, uint16_t Signal=0) except? -1:
+    """Send a signal to a slurm job step.
+
+    Args:
+        JobID (int): The job id.
+        Signal (int, optional): Signal to send.
+
+    Returns:
+        int: 0 for success or -1 for error and the set Slurm errno
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_signal_job(JobID, Signal)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+#
+# Slurm Job/Step Signaling Functions
+#
+
+
+cpdef int slurm_kill_job(uint32_t JobID=0, uint16_t Signal=0,
+                         uint16_t BatchFlag=0) except? -1:
+    """Terminate a running slurm job step.
+
+    Args:
+        JobID (int): The job id.
+        Signal (int): Signal to send.
+        BatchFlag (int, optional): Job batch flag.
+
+    Returns:
+        int: 0 for success or -1 for error and set slurm errno
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_kill_job(JobID, Signal, BatchFlag)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_kill_job2(const char *JobID='', uint16_t Signal=0,
+                          uint16_t BatchFlag=0, char* sibling=NULL) except? -1:
+    """Terminate a running slurm job step.
+
+    Args:
+        JobID (str): The job id.
+        Signal (int): Signal to send.
+        BatchFlag (int, optional): Job batch flag.
+        sibling (str, optional): Sibling cluster to send the message to.
+
+    Returns:
+        int: 0 for success or -1 for error, and slurm errno is set.
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_kill_job2(JobID, Signal, BatchFlag, sibling)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+cpdef int slurm_notify_job(uint32_t JobID=0, char* Msg='') except? -1:
+    """Notify a message to a running slurm job step.
+
+    Args:
+        JobID (int): The job id
+        Msg (str): Message to send to the job.
+
+    Returns:
+        int: 0 for success or -1 on error
+    """
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_notify_job(JobID, Msg)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+#
+# Slurm Job Class to Control Configuration Read/Update
+#
+
+
+cdef class job:
+    """Slurm Job Information."""
+
+    cdef:
+        slurm.job_info_msg_t *_job_ptr
+        slurm.slurm_job_info_t *_record
+        slurm.time_t _lastUpdate
+        slurm.time_t _lastBackfill
+        uint16_t _ShowFlags
+        dict _JobDict
+
+    def __cinit__(self):
+        self._job_ptr = NULL
+        self._lastUpdate = 0
+        self._lastBackfill = 0
+        self._ShowFlags = slurm.SHOW_DETAIL | slurm.SHOW_ALL
+
+    def __dealloc__(self):
+        pass
+
+    def lastUpdate(self):
+        """Get the time (epoch seconds) the job data was updated.
+
+        Returns:
+            (int): Epoch seconds
+        """
+        return self._lastUpdate
+
+    def lastBackfill(self):
+        """Get the time (epoch seconds) of last backfilling run.
+
+        Returns:
+            (int): Epoch seconds
+        """
+        return self._lastBackfill
+
+    def ids(self):
+        """Return the job IDs from retrieved data.
+
+        Returns:
+            (dict): Dictionary of job IDs
+        """
+        cdef:
+            int rc
+            int apiError
+            uint32_t i
+            list all_jobs
+
+        rc = slurm.slurm_load_jobs(<time_t> NULL, &self._job_ptr, self._ShowFlags)
+
+        if rc == slurm.SLURM_SUCCESS:
+            all_jobs = []
+            for i in range(self._job_ptr.record_count):
+                all_jobs.append(self._job_ptr.job_array[i].job_id)
+            slurm.slurm_free_job_info_msg(self._job_ptr)
+            self._job_ptr = NULL
+            return all_jobs
+        else:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    def find(self, name='', val=''):
+        """Search for a property and associated value in the retrieved job data.
+
+        Args:
+            name (str): key string to search
+            val (str): value string to match
+
+        Returns:
+            (list): List of IDs that match
+        """
+        cdef:
+            list retList = []
+            dict _job_dict = {}
+
+        _job_dict = self.get()
+
+        if val != '':
+            for key, value in _job_dict.items():
+                if _job_dict[key][name] == val:
+                    retList.append(key)
+
+        return retList
+
+    cdef _load_single_job(self, jobid):
+        """Uses slurm_load_job to setup the self._job_ptr for a single job given by the jobid.
+        After calling this, the job pointer can be used in other methods
+        to operate on the information of the job.
+
+        Raises an value error if the jobid does not correspond to a existing job.
+
+        Args:
+            jobid (str): The job id.
+        """
+        cdef:
+            int apiError
+            int rc
+
+        # jobid can be given as int or string
+        if isinstance(jobid, int):
+            jobid = str(jobid).encode("UTF-8")
+        else:
+            jobid = jobid.encode("UTF-8")
+        # load the job which sets the self._job_ptr pointer
+        rc = slurm.slurm_load_job(&self._job_ptr, jobid, self._ShowFlags)
+
+        if rc != slurm.SLURM_SUCCESS:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    def find_id(self, jobid):
+        """Retrieve job ID data.
+
+        This method accepts both string and integer formats of the jobid.
+        This works for single jobs and job arrays. It uses the internal
+        helper _load_single_job to do slurm_load_job. If the job corresponding
+        to the jobid does not exist, a ValueError will be raised.
+
+        Args:
+            jobid (str): Job id key string to search
+
+        Returns:
+            (list): List of dictionary of values for given job id
+        """
+        self._load_single_job(jobid)
+        return list(self.get_job_ptr().values())
+
+    def find_user(self, user):
+        """Retrieve a user's job data.
+
+        This method calls slurm_load_job_user to get all job_table records
+        associated with a specific user.
+
+        Args:
+            user (str): User string to search
+
+        Returns:
+            (dict): Dictionary of values for all user's jobs
+        """
+        cdef:
+            int apiError
+            int rc
+            uint32_t uid
+
+        if isinstance(user, str):
+            try:
+                uid = getpwnam(user).pw_uid
+            except KeyError:
+                raise KeyError("user %s not found on this system." % user)
+        else:
+            uid = user
+
+        rc = slurm.slurm_load_job_user(&self._job_ptr, uid, self._ShowFlags)
+
+        if rc == slurm.SLURM_SUCCESS:
+            return self.get_job_ptr()
+        else:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    def get(self):
+        """Get all slurm jobs information.
+
+        This method calls slurm_load_jobs to get job_table records for all
+        jobs
+
+        Returns:
+            (dict): Data where key is the job name, each entry contains a
+                dictionary of job attributes
+        """
+        cdef:
+            int apiError
+            int rc
+
+        rc = slurm.slurm_load_jobs(<time_t> NULL, &self._job_ptr, self._ShowFlags)
+
+        if rc == slurm.SLURM_SUCCESS:
+            return self.get_job_ptr()
+        else:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    cdef dict get_job_ptr(self):
+        """Convert all job arrays in buffer to dictionary.
+
+        Returns:
+            dict: dictionary of job attributes
+        """
+        cdef:
+            char time_str[32]
+            char tmp_line[1024 * 128]
+            time_t end_time
+            time_t run_time
+            uint16_t exit_status
+            uint16_t term_sig
+            uint32_t i
+            dict Job_dict
+
+        self._JobDict = {}
+        self._lastUpdate = self._job_ptr.last_update
+        self._lastBackfill = self._job_ptr.last_backfill
+        exit_status = 0
+        term_sig = 0
+
+        for i in range(self._job_ptr.record_count):
+            self._record = &self._job_ptr.job_array[i]
+            Job_dict = {}
+
+            Job_dict['account'] = stringOrNone(self._record.account, '')
+
+            slurm.slurm_make_time_str(&self._record.accrue_time, time_str,
+                                      sizeof(time_str))
+            Job_dict['accrue_time'] = stringOrNone(time_str, '')
+
+            Job_dict['admin_comment'] = stringOrNone(self._record.admin_comment, '')
+            Job_dict['alloc_node'] = stringOrNone(self._record.alloc_node, '')
+            Job_dict['alloc_sid'] = self._record.alloc_sid
+
+            if self._record.array_job_id:
+                if self._record.array_task_str:
+                    Job_dict['array_job_id'] = self._record.array_job_id
+                    Job_dict['array_task_id'] = None
+                    Job_dict['array_task_str'] = stringOrNone(
+                        self._record.array_task_str, ''
+                    )
+                else:
+                    Job_dict['array_job_id'] = self._record.array_job_id
+                    Job_dict['array_task_id'] = self._record.array_task_id
+                    Job_dict['array_task_str'] = None
+                if self._record.array_max_tasks:
+                    Job_dict['array_task_throttle'] = self._record.array_max_tasks
+            else:
+                Job_dict['array_job_id'] = None
+                Job_dict['array_task_id'] = None
+                Job_dict['array_task_str'] = None
+
+            if self._record.het_job_id:
+                Job_dict['het_job_id'] = self._record.het_job_id
+                Job_dict['het_job_id_set'] = stringOrNone(
+                    self._record.het_job_id_set, ''
+                )
+                Job_dict['het_job_offset'] = self._record.het_job_offset
+            else:
+                Job_dict['het_job_id'] = None
+                Job_dict['het_job_id_set'] = None
+                Job_dict['het_job_offset'] = None
+
+            if self._record.array_max_tasks:
+                Job_dict['array_max_tasks'] = self._record.array_max_tasks
+            else:
+                Job_dict['array_max_tasks'] = None
+
+            Job_dict['assoc_id'] = self._record.assoc_id
+            Job_dict['batch_flag'] = self._record.batch_flag
+            Job_dict['batch_features'] = stringOrNone(self._record.batch_features, '')
+            Job_dict['batch_host'] = stringOrNone(self._record.batch_host, '')
+
+            if self._record.billable_tres == NO_VAL_DOUBLE:
+                Job_dict['billable_tres'] = None
+            else:
+                Job_dict['billable_tres'] = self._record.billable_tres
+
+            Job_dict['bitflags'] = self._record.bitflags
+            Job_dict['boards_per_node'] = self._record.boards_per_node
+            Job_dict['burst_buffer'] = stringOrNone(self._record.burst_buffer, '')
+            Job_dict['burst_buffer_state'] = stringOrNone(
+                self._record.burst_buffer_state, ''
+            )
+
+            if self._record.cluster_features:
+                Job_dict['cluster_features'] = stringOrNone(
+                    self._record.cluster_features, ''
+                )
+
+            Job_dict['command'] = stringOrNone(self._record.command, '')
+            Job_dict['comment'] = stringOrNone(self._record.comment, '')
+            Job_dict['contiguous'] = bool(self._record.contiguous)
+            Job_dict['core_spec'] = int16orNone(self._record.core_spec)
+            Job_dict['cores_per_socket'] = int16orNone(self._record.cores_per_socket)
+
+            if self._record.cpus_per_task == slurm.NO_VAL16:
+                Job_dict['cpus_per_task'] = "N/A"
+            else:
+                Job_dict['cpus_per_task'] = self._record.cpus_per_task
+
+            Job_dict['cpus_per_tres'] = stringOrNone(self._record.cpus_per_tres, '')
+            Job_dict['cpu_freq_gov'] = int32orNone(self._record.cpu_freq_gov)
+            Job_dict['cpu_freq_max'] = int32orNone(self._record.cpu_freq_max)
+            Job_dict['cpu_freq_min'] = int32orNone(self._record.cpu_freq_min)
+            Job_dict['dependency'] = stringOrNone(self._record.dependency, '')
+
+            if WIFSIGNALED(self._record.derived_ec):
+                term_sig = WTERMSIG(self._record.derived_ec)
+            elif WIFEXITED(self._record.derived_ec):
+                exit_status = WEXITSTATUS(self._record.derived_ec)
+
+            Job_dict['derived_ec'] = str(exit_status) + ":" + str(term_sig)
+
+            Job_dict['eligible_time'] = self._record.eligible_time
+            Job_dict['end_time'] = self._record.end_time
+            Job_dict['exc_nodes'] = listOrNone(self._record.exc_nodes, ',')
+
+            if WIFSIGNALED(self._record.exit_code):
+                term_sig = WTERMSIG(self._record.exit_code)
+            elif WIFEXITED(self._record.exit_code):
+                exit_status = WEXITSTATUS(self._record.exit_code)
+
+            Job_dict['exit_code'] = str(exit_status) + ":" + str(term_sig)
+
+            Job_dict['features'] = listOrNone(self._record.features, ',')
+
+            if self._record.fed_siblings_active or self._record.fed_siblings_viable:
+                Job_dict['fed_origin'] = stringOrNone(
+                    self._record.fed_origin_str, ''
+                )
+                Job_dict['fed_viable_siblings'] = stringOrNone(
+                    self._record.fed_siblings_viable_str, ''
+                )
+                Job_dict['fed_active_siblings'] = stringOrNone(
+                    self._record.fed_siblings_active_str, ''
+                )
+
+            if self._record.bitflags & (GRES_DISABLE_BIND |
+                                        GRES_ENFORCE_BIND |
+                                        KILL_INV_DEP |
+                                        NO_KILL_INV_DEP |
+                                        SPREAD_JOB):
+                if self._record.bitflags & GRES_DISABLE_BIND:
+                    Job_dict['gres_enforce_bind'] = "No"
+                if self._record.bitflags & GRES_ENFORCE_BIND:
+                    Job_dict['gres_enforce_bind'] = "Yes"
+                if self._record.bitflags & KILL_INV_DEP:
+                    Job_dict['kill_on_invalid_dependent'] = "Yes"
+                if self._record.bitflags & NO_KILL_INV_DEP:
+                    Job_dict['kill_on_invalid_dependent'] = "No"
+                if self._record.bitflags & SPREAD_JOB:
+                    Job_dict['spread_job'] = "Yes"
+
+            Job_dict['group_id'] = self._record.group_id
+
+            # JOB RESOURCES HERE
+            Job_dict['job_id'] = self._record.job_id
+            Job_dict['job_state'] = stringOrNone(
+                slurm.slurm_job_state_string(self._record.job_state), ''
+            )
+
+            slurm.slurm_make_time_str(&self._record.last_sched_eval, time_str,
+                                      sizeof(time_str))
+            Job_dict['last_sched_eval'] = stringOrNone(time_str, '')
+
+            Job_dict['licenses'] = __get_licenses(self._record.licenses)
+            Job_dict['max_cpus'] = self._record.max_cpus
+            Job_dict['max_nodes'] = self._record.max_nodes
+            Job_dict['mem_per_tres'] = stringOrNone(self._record.mem_per_tres, '')
+            Job_dict['name'] = stringOrNone(self._record.name, '')
+            Job_dict['network'] = stringOrNone(self._record.network, '')
+            Job_dict['nodes'] = stringOrNone(self._record.nodes, '')
+            Job_dict['nice'] = (<int64_t>self._record.nice) - NICE_OFFSET
+            Job_dict['ntasks_per_core'] = int16orUnlimited(self._record.ntasks_per_core, "int")
+            Job_dict['ntasks_per_core_str'] = int16orUnlimited(self._record.ntasks_per_core, "string")
+            Job_dict['ntasks_per_node'] = self._record.ntasks_per_node
+            Job_dict['ntasks_per_socket'] = int16orUnlimited(self._record.ntasks_per_socket, "int")
+            Job_dict['ntasks_per_socket_str'] = int16orUnlimited(self._record.ntasks_per_socket, "string")
+            Job_dict['ntasks_per_board'] = self._record.ntasks_per_board
+            Job_dict['num_cpus'] = self._record.num_cpus
+            Job_dict['num_nodes'] = self._record.num_nodes
+            Job_dict['num_tasks'] = self._record.num_tasks
+            Job_dict['partition'] = stringOrNone(self._record.partition, '')
+
+            if self._record.pn_min_memory & slurm.MEM_PER_CPU:
+                self._record.pn_min_memory &= (~slurm.MEM_PER_CPU)
+                Job_dict['mem_per_cpu'] = True
+                Job_dict['min_memory_cpu'] = self._record.pn_min_memory
+                Job_dict['mem_per_node'] = False
+                Job_dict['min_memory_node'] = None
+            else:
+                Job_dict['mem_per_cpu'] = False
+                Job_dict['min_memory_cpu'] = None
+                Job_dict['mem_per_node'] = True
+                Job_dict['min_memory_node'] = self._record.pn_min_memory
+
+            Job_dict['pn_min_memory'] = self._record.pn_min_memory
+            Job_dict['pn_min_cpus'] = self._record.pn_min_cpus
+            Job_dict['pn_min_tmp_disk'] = self._record.pn_min_tmp_disk
+
+            if self._record.preemptable_time:
+                slurm.slurm_make_time_str(
+                    &self._record.preemptable_time, time_str, sizeof(time_str)
+                )
+                Job_dict['preempt_eligible_time'] = stringOrNone(time_str, '')
+
+                if self._record.preempt_time == 0:
+                    Job_dict['preempt_time'] = "None"
+                else:
+                    slurm.slurm_make_time_str(&self._record.preempt_time, time_str, sizeof(time_str))
+                    Job_dict['preempt_time'] = stringOrNone(time_str, '')
+
+            Job_dict['priority'] = self._record.priority
+            Job_dict['profile'] = self._record.profile
+            Job_dict['qos'] = stringOrNone(self._record.qos, '')
+            Job_dict['reboot'] = self._record.reboot
+            Job_dict['req_nodes'] = listOrNone(self._record.req_nodes, ',')
+            Job_dict['req_switch'] = self._record.req_switch
+            Job_dict['requeue'] = bool(self._record.requeue)
+            Job_dict['resize_time'] = self._record.resize_time
+            Job_dict['restart_cnt'] = self._record.restart_cnt
+            Job_dict['resv_name'] = stringOrNone(self._record.resv_name, '')
+
+            if IS_JOB_PENDING(self._job_ptr.job_array[i]):
+                run_time = 0
+            elif IS_JOB_SUSPENDED(self._job_ptr.job_array[i]):
+                run_time = self._record.pre_sus_time
+            else:
+                if (IS_JOB_RUNNING(self._job_ptr.job_array[i]) or self._record.end_time == 0):
+                    end_time = time(NULL)
+                else:
+                    end_time = self._record.end_time
+
+                if self._record.suspend_time:
+                    run_time = <time_t>difftime(end_time, self._record.suspend_time) + self._record.pre_sus_time
+                else:
+                    run_time = <time_t>difftime(end_time, self._record.start_time)
+
+            Job_dict['run_time'] = run_time
+            Job_dict['run_time_str'] = secs2time_str(run_time)
+            Job_dict['sched_nodes'] = stringOrNone(self._record.sched_nodes, '')
+            Job_dict['selinux_context'] = stringOrNone(self._record.selinux_context, '')
+
+            if self._record.shared == 0:
+                Job_dict['shared'] = "0"
+            elif self._record.shared == 1:
+                Job_dict['shared'] = "1"
+            elif self._record.shared == 2:
+                Job_dict['shared'] = "USER"
+            else:
+                Job_dict['shared'] = "OK"
+
+            Job_dict['sockets_per_board'] = self._record.sockets_per_board
+            Job_dict['sockets_per_node'] = int16orNone(self._record.sockets_per_node)
+            Job_dict['start_time'] = self._record.start_time
+
+            if self._record.state_desc:
+                Job_dict['state_reason'] = self._record.state_desc.decode("UTF-8").replace(" ", "_")
+            else:
+                Job_dict['state_reason'] = stringOrNone(
+                    slurm.slurm_job_state_reason_string(
+                        <slurm.job_state_reason>self._record.state_reason
+                    ), ''
+                )
+
+            if self._record.batch_flag:
+                slurm.slurm_get_job_stderr(tmp_line, sizeof(tmp_line), self._record)
+                Job_dict['std_err'] = stringOrNone(tmp_line, '')
+
+                slurm.slurm_get_job_stdin(tmp_line, sizeof(tmp_line), self._record)
+                Job_dict['std_in'] = stringOrNone(tmp_line, '')
+
+                slurm.slurm_get_job_stdout(tmp_line, sizeof(tmp_line), self._record)
+                Job_dict['std_out'] = stringOrNone(tmp_line, '')
+            else:
+                Job_dict['std_err'] = None
+                Job_dict['std_in'] = None
+                Job_dict['std_out'] = None
+
+            Job_dict['submit_time'] = self._record.submit_time
+            Job_dict['suspend_time'] = self._record.suspend_time
+            Job_dict['system_comment'] = stringOrNone(self._record.system_comment, '')
+
+            if self._record.time_limit == slurm.NO_VAL:
+                Job_dict['time_limit'] = "Partition_Limit"
+                Job_dict['time_limit_str'] = "Partition_Limit"
+            elif self._record.time_limit == slurm.INFINITE:
+                Job_dict['time_limit'] = "UNLIMITED"
+                Job_dict['time_limit_str'] = "UNLIMITED"
+            else:
+                Job_dict['time_limit'] = self._record.time_limit
+                Job_dict['time_limit_str'] = mins2time_str(
+                    self._record.time_limit)
+
+            Job_dict['time_min'] = self._record.time_min
+            Job_dict['threads_per_core'] = int16orNone(self._record.threads_per_core)
+            Job_dict['tres_alloc_str'] = stringOrNone(self._record.tres_alloc_str, '')
+            Job_dict['tres_bind'] = stringOrNone(self._record.tres_bind, '')
+            Job_dict['tres_freq'] = stringOrNone(self._record.tres_freq, '')
+            Job_dict['tres_per_job'] = stringOrNone(self._record.tres_per_job, '')
+            Job_dict['tres_per_node'] = stringOrNone(self._record.tres_per_node, '')
+            Job_dict['tres_per_socket'] = stringOrNone(self._record.tres_per_socket, '')
+            Job_dict['tres_per_task'] = stringOrNone(self._record.tres_per_task, '')
+            Job_dict['tres_req_str'] = stringOrNone(self._record.tres_req_str, '')
+            Job_dict['user_id'] = self._record.user_id
+            Job_dict['wait4switch'] = self._record.wait4switch
+            Job_dict['wckey'] = stringOrNone(self._record.wckey, '')
+            Job_dict['work_dir'] = stringOrNone(self._record.work_dir, '')
+
+            Job_dict['cpus_allocated'] = {}
+            Job_dict['cpus_alloc_layout'] = {}
+
+            if self._record.nodes is not NULL:
+                hl = hostlist()
+                _nodes = stringOrNone(self._record.nodes, '')
+                hl.create(_nodes)
+                host_list = hl.get_list()
+                if host_list:
+                    for node_name in host_list:
+                        b_node_name = node_name.decode("UTF-8")
+                        Job_dict['cpus_allocated'][b_node_name] = 0
+                        Job_dict['cpus_alloc_layout'][b_node_name] = []
+                hl.destroy()
+
+            self._JobDict[self._record.job_id] = Job_dict
+
+        slurm.slurm_free_job_info_msg(self._job_ptr)
+        self._job_ptr = NULL
+        return self._JobDict
+
+    def __unrange(self, bit_str):
+        """converts a string describing a bitmap (from slurm_job_cpus_allocated_str_on_node()) to a list.
+
+        Args:
+            bit_str (str): string describing a bitmap (e.g. "0-30,45,50-60")
+
+        Returns:
+            (list): List referring to bitmap (empty if not successful)
+        """
+        r_list = []
+
+        if not bit_str:
+            return []
+
+        for cpu_set in bit_str.split(','):
+            try:
+                cpus = list(map(int, cpu_set.split('-')))
+                for i in range(cpus[0], cpus[-1] + 1):
+                    r_list.append(i)
+            except:
+                return []
+
+        return r_list
+
+    cpdef __free(self):
+        """Release storage generated by the slurm_get_job_steps function."""
+        if self._job_ptr is not NULL:
+            slurm.slurm_free_job_info_msg(self._job_ptr)
+
+    def slurm_job_batch_script(self, jobid):
+        """Return the contents of the batch-script for a Job.
+
+        The string returned also includes all the "\\n" characters (new-line).
+
+        Args:
+            jobid (Union[str, int]): ID of the Job for which the script should
+                be retrieved.
+
+        Returns:
+            (str): The content of the batch script.
+        """
+        if isinstance(jobid, int):
+            jobid = str(jobid).encode("UTF-8")
+        else:
+            jobid = jobid.encode("UTF-8")
+
+        return pyslurm.core.job.Job(jobid).get_batch_script()
+
+    cdef int fill_job_desc_from_opts(self, dict job_opts, slurm.job_desc_msg_t *desc):
+        """
+        https://github.com/SchedMD/slurm/blob/0bc4ac4902c4c150ee66b90fb41f3c67352f85ba/src/api/init_msg.c#L54
+        https://github.com/SchedMD/slurm/blob/a8f0ff71504e77feb7fa744ba1f6d44daedb6989/src/sbatch/opt.c#L294
+
+        Do I even need to set some of the defaults?
+
+        python dict options should match slurm sbatch long options:
+            https://github.com/SchedMD/slurm/blob/63a06811441dd7882083c282d92ae6596ec00a8a/src/sbatch/opt.c#L755
+
+        * make sure options match sbatch command line opts and not struct member names.
+        """
+        cdef:
+            int i
+
+        # TODO: jobid_set
+        # https://github.com/SchedMD/slurm/blob/a8f0ff71504e77feb7fa744ba1f6d44daedb6989/src/sbatch/opt.c#L384
+        if job_opts.get("contiguous") == 1:
+            desc.contiguous = 1
+        else:
+            desc.contiguous = 0
+
+        if job_opts.get("container"):
+            container = job_opts.get("container").encode("UTF-8", "replace")
+            desc.container = container
+
+        if job_opts.get("core_spec"):
+            desc.core_spec = job_opts.get("core_spec")
+        else:
+            desc.core_spec = slurm.NO_VAL16
+
+        if job_opts.get("constraints"):
+            features = job_opts.get("constraints").encode("UTF-8", "replace")
+            desc.features = features
+
+        if job_opts.get("immediate"):
+            desc.immediate = job_opts.get("immediate")
+        else:
+            desc.immediate = 0
+
+        if job_opts.get("job_name"):
+            name = job_opts.get("job_name").encode("UTF-8", "replace")
+            desc.name = name
+        else:
+            desc.name = "sbatch"
+
+        if job_opts.get("reservation"):
+            reservation = job_opts.get("reservation").encode("UTF-8", "replace")
+            desc.reservation = reservation
+
+        if job_opts.get("wckey"):
+            wckey = job_opts.get("wckey").encode("UTF-8", "replace")
+            desc.wckey = wckey
+
+        # TODO when nodelist is set, min_nodes needs to be adjusted accordingly
+        if job_opts.get("nodelist"):
+            req_nodes = job_opts.get("nodelist").encode("UTF-8", "replace")
+            desc.req_nodes = req_nodes
+
+        if job_opts.get("exc_nodes"):
+            exc_nodes = job_opts.get("exc_nodes").encode("UTF-8", "replace")
+            desc.exc_nodes = exc_nodes
+
+        if job_opts.get("partition"):
+            partition = job_opts.get("partition").encode("UTF-8", "replace")
+            desc.partition = partition
+
+        if job_opts.get("profile"):
+            desc.profile = job_opts.get("profile")
+        else:
+            desc.profile = ACCT_GATHER_PROFILE_NOT_SET
+
+        if job_opts.get("licenses"):
+            licenses = job_opts.get("licenses").encode("UTF-8", "replace")
+            desc.licenses = licenses
+
+        if job_opts.get("min_nodes"):
+            desc.min_nodes = job_opts.get("min_nodes")
+            if job_opts.get("max_nodes"):
+                desc.max_nodes = job_opts.get("max_nodes")
+        elif "ntasks" in job_opts and job_opts.get("min_nodes") == 0:
+            desc.min_nodes = 0
+
+        if job_opts.get("ntasks_per_node"):
+            ntasks_per_node = job_opts.get("ntasks_per_node")
+            desc.ntasks_per_node = ntasks_per_node
+
+        if job_opts.get("uid"):
+            desc.user_id = job_opts.get("uid")
+        else:
+            desc.user_id = getuid()
+
+        if job_opts.get("gid"):
+            desc.group_id = job_opts.get("gid")
+        else:
+            desc.group_id = getgid()
+
+        if job_opts.get("dependency"):
+            dependency = job_opts.get("dependency").encode("UTF-8", "replace")
+            desc.dependency = dependency
+
+        if job_opts.get("array_inx"):
+            array_inx = job_opts.get("array_inx").encode("UTF-8")
+            desc.array_inx = array_inx
+
+        if job_opts.get("mem_bind"):
+            mem_bind = job_opts.get("mem_bind").encode("UTF-8")
+            desc.mem_bind = mem_bind
+
+        if job_opts.get("mem_bind_type"):
+            desc.mem_bind_type = job_opts.get("mem_bind_type")
+        else:
+            desc.mem_bind_type = 0
+
+        if job_opts.get("plane_size"):
+            desc.plane_size = job_opts.get("plane_size")
+
+        if job_opts.get("distribution"):
+            desc.task_dist = job_opts.get("distribution")
+        else:
+            desc.task_dist = slurm.SLURM_DIST_UNKNOWN
+
+        if job_opts.get("container"):
+            container = job_opts.get("container").encode("UTF-8", "replace")
+            desc.container = container
+
+        # TODO: what's the default opt.network?
+        # Slurm on Cray
+        if job_opts.get("network"):
+            network = job_opts.get("network").encode("UTF-8", "replace")
+            desc.network = network
+
+        if job_opts.get("nice"):
+            desc.nice = NICE_OFFSET + job_opts.get("nice")
+
+        if job_opts.get("priority"):
+            desc.priority = job_opts.get("priority")
+
+        if job_opts.get("mail_type"):
+            desc.mail_type = job_opts.get("mail_type")
+        else:
+            desc.mail_type = 0
+
+        if job_opts.get("mail_user"):
+            mail_user = job_opts.get("mail_user").encode("UTF-8", "replace")
+            desc.mail_user = mail_user
+
+        # TODO: does begin need to get translated from string/epoch to time_t?
+        if job_opts.get("begin"):
+            desc.begin_time = job_opts.get("begin")
+        else:
+            desc.begin_time = 0
+
+        # TODO: does deadline need to get translated from string/epoch to time_t?
+        if job_opts.get("deadline"):
+            desc.deadline = job_opts.get("deadline")
+        else:
+            desc.deadline = 0
+
+        if job_opts.get("delay_boot"):
+            desc.delay_boot = job_opts.get("delay_boot")
+
+        if job_opts.get("account"):
+            account = job_opts.get("account").encode("UTF-8", "replace")
+            desc.account = account
+
+        if job_opts.get("comment"):
+            comment = job_opts.get("comment").encode("UTF-8", "replace")
+            desc.comment = comment
+
+        if job_opts.get("qos"):
+            qos = job_opts.get("qos").encode("UTF-8", "replace")
+            desc.qos = qos
+
+        if job_opts.get("hold"):
+            desc.priority = 0
+
+        # BG parameters
+        # opt.geometry
+        #   slurmdb_setup_cluster_dims() doesn't appear to be externalized
+        # opt.conn_type
+
+        if job_opts.get("reboot"):
+            desc.reboot = 1
+
+        # job constraints
+        if job_opts.get("mincpus"):
+            desc.pn_min_cpus = job_opts.get("mincpus")
+
+        if job_opts.get("realmem"):
+            desc.pn_min_memory = job_opts.get("realmem")
+        elif job_opts.get("mem_per_cpu"):
+            desc.pn_min_memory = job_opts.get("mem_per_cpu") | slurm.MEM_PER_CPU
+
+        if job_opts.get("tmpdisk"):
+            desc.pn_min_tmp_disk = job_opts.get("tmpdisk")
+
+        if job_opts.get("overcommit"):
+            desc.min_cpus = max(job_opts.get("min_nodes", 1), 1)
+            desc.overcommit = job_opts.get("overcommit")
+        elif job_opts.get("cpus_per_task"):
+            desc.min_cpus = job_opts.get("ntasks", 1) * job_opts.get("cpus_per_task")
+        elif job_opts.get("nodelist") and job_opts.get("min_nodes") == 0:
+            desc.min_cpus = 0
+        else:
+            desc.min_cpus = job_opts.get("ntasks", 1)
+
+        if job_opts.get("cpus_per_task"):
+            desc.cpus_per_task = job_opts.get("cpus_per_task")
+
+        if job_opts.get("ntasks"):
+            desc.num_tasks = job_opts.get("ntasks")
+
+        if job_opts.get("ntasks_per_socket"):
+            desc.ntasks_per_socket = job_opts.get("ntasks_per_socket")
+
+        if job_opts.get("ntasks_per_core"):
+            desc.ntasks_per_core = job_opts.get("ntasks_per_core")
+
+        # node constraints
+        if job_opts.get("sockets_per_node"):
+            desc.sockets_per_node = job_opts.get("sockets_per_node")
+
+        if job_opts.get("cores_per_socket"):
+            desc.cores_per_socket = job_opts.get("cores_per_socket")
+
+        if job_opts.get("threads_per_core"):
+            desc.threads_per_core = job_opts.get("threads_per_core")
+
+        if job_opts.get("no_kill"):
+            desc.kill_on_node_fail = 0
+
+        if job_opts.get("time_limit"):
+            desc.time_limit = job_opts.get("time_limit")
+
+        if job_opts.get("time_min"):
+            desc.time_min = job_opts.get("time_min")
+
+        if job_opts.get("shared"):
+            desc.shared = job_opts.get("shared")
+
+        if job_opts.get("wait_all_nodes"):
+            desc.wait_all_nodes = job_opts.get("wait_all_nodes")
+        else:
+            desc.wait_all_nodes = slurm.NO_VAL16
+
+        if job_opts.get("warn_flags"):
+            desc.warn_flags = job_opts.get("warn_flags")
+
+        if job_opts.get("warn_signal"):
+            desc.warn_signal = job_opts.get("warn_signal")
+
+        if job_opts.get("warn_time"):
+            desc.warn_time = job_opts.get("warn_time")
+
+        # src/sbatch/sbatch.c#L595
+        desc.environment = NULL
+        if job_opts.get("export_file"):
+            # desc->environment = env_array_from_file(opt.export_file);
+            #   if (desc->environment == NULL)
+            #   exit(1);
+            pass
+
+        job_opts["get_user_env_time"] = -1
+
+        if not job_opts.get("export_env"):
+            slurm.slurm_env_array_merge(&desc.environment, <const char**>slurm.environ)
+        elif job_opts.get("export_env") == "ALL":
+            slurm.slurm_env_array_merge(&desc.environment, <const char**>slurm.environ)
+        elif job_opts.get("export_env") == "NONE":
+            desc.environment = slurm.slurm_env_array_create()
+            # env_array_merge_slurm(&desc->environment, (const char **)environ);
+            job_opts["get_user_env_time"] = 0
+        else:
+            # _env_merge_filter(desc)
+            job_opts["get_user_env_time"] = 0
+
+        if job_opts["get_user_env_time"] >= 0:
+            slurm.slurm_env_array_overwrite(&desc.environment, "SLURM_GET_USER_ENV", "1")
+
+        desc.env_size = self.envcount(desc.environment)
+
+        # don't need argv/argc since jobscript is not submitted via cmdline with arguments.
+
+        if job_opts.get("error"):
+            std_err = job_opts.get("error").encode("UTF-8", "replace")
+            desc.std_err = std_err
+
+        if job_opts.get("input"):
+            std_in = job_opts.get("input").encode("UTF-8", "replace")
+            desc.std_in = std_in
+        else:
+            desc.std_in = "/dev/null"
+
+        if job_opts.get("output"):
+            std_out = job_opts.get("output").encode("UTF-8", "replace")
+            desc.std_out = std_out
+
+        # FIXME: should this be python's getcwd or C's getcwd?
+        # also, allow option to specify work_dir, if not, set default
+
+        if job_opts.get("work_dir"):
+            work_dir = job_opts.get("work_dir").encode("UTF-8", "replace")
+            desc.work_dir = work_dir
+        else:
+            cwd = os.getcwd().encode("UTF-8", "replace")
+            desc.work_dir = cwd
+
+        if job_opts.get("requeue"):
+            desc.requeue = job_opts.get("requeue")
+
+        if job_opts.get("open_mode"):
+            desc.open_mode = job_opts.get("open_mode")
+
+        if job_opts.get("acctg_freq"):
+            acctg_freq = job_opts.get("acctg_freq").encode("UTF-8")
+            desc.acctg_freq = acctg_freq
+
+        # TODO: spank_job_env_size
+
+        if job_opts.get("cpu_freq_min"):
+            desc.cpu_freq_min = job_opts.get("cpu_freq_min")
+        else:
+            desc.cpu_freq_min = slurm.NO_VAL
+
+        if job_opts.get("cpu_freq_max"):
+            desc.cpu_freq_max = job_opts.get("cpu_freq_max")
+        else:
+            desc.cpu_freq_max = slurm.NO_VAL
+
+        if job_opts.get("cpu_freq_gov"):
+            desc.cpu_freq_gov = job_opts.get("cpu_freq_gov")
+        else:
+            desc.cpu_freq_gov = slurm.NO_VAL
+
+        if job_opts.get("req_switch") and job_opts.get("req_switch") >= 0:
+            desc.req_switch = job_opts.get("req_switch")
+
+        if job_opts.get("wait4switch") and job_opts.get("wait4switch") >= 0:
+            desc.wait4switch = job_opts.get("wait4switch")
+
+        if job_opts.get("job_flags"):
+            desc.bitflags = job_opts.get("job_flags")
+
+        if job_opts.get("mcs_label"):
+            mcs_label = job_opts.get("mcs_label").encode("UTF-8", "replace")
+            desc.mcs_label = mcs_label
+
+        if job_opts.get("tres_per_job"):
+            tres_per_job = job_opts.get("tres_per_job").encode("UTF-8", "replace")
+            desc.tres_per_job = tres_per_job
+
+        if job_opts.get("tres_per_node"):
+            tres_per_node = job_opts.get("tres_per_node").encode("UTF-8", "replace")
+            desc.tres_per_node = tres_per_node
+
+        if job_opts.get("tres_per_task"):
+            tres_per_task = job_opts.get("tres_per_task").encode("UTF-8", "replace")
+            desc.tres_per_task = tres_per_task
+
+        return 0
+
+    cdef int envcount(self, char **env):
+        """
+        Return the number of elements in the environment `env`.
+        """
+        cdef int envc = 0
+        while (env[envc] != NULL):
+            envc += 1
+        return envc
+
+    cdef void print_db_notok(self, const char *cname, bool isenv):
+        b_all = "all".encode("UTF-8", "replace")
+        if errno:
+            sys.stderr.write("There is a problem talking to the database:") # %m.  "
+#                  "Only local cluster communication is available, remove "
+#                  "%s or contact your admin to resolve the problem.",
+#                  isenv ? "SLURM_CLUSTERS from your environment" :
+#                  "--cluster from your command line")
+            sys.exit(slurm.SLURM_ERROR)
+        elif cname == b_all:
+            sys.stderr.write("No clusters can be reached now. Contact your admin to resolve the problem.")
+            sys.exit(slurm.SLURM_ERROR)
+        else:
+            sys.stderr.write("%s can't be reached now, or it is an invalid entry for %s.  " % cname)
+#                  "Use 'sacctmgr list clusters' to see available clusters.",
+#                  cname, isenv ? "SLURM_CLUSTERS" : "--cluster")
+            sys.exit(slurm.SLURM_ERROR)
+
+    cdef bool is_alps_cray_system(self):
+        if slurm.working_cluster_rec:
+            return slurm.working_cluster_rec.flags
+        if ALPS_CRAY_SYSTEM:
+            return True
+        return False
+
+    cdef int _check_cluster_specific_settings(self, slurm.job_desc_msg_t *req):
+        cdef int rc = slurm.SLURM_SUCCESS
+
+        if self.is_alps_cray_system():
+            if req.shared and req.shared != <uint16_t>slurm.NO_VAL:
+                print("--share is not supported on Cray/ALPS systems.")
+                req.shared = <uint16_t>slurm.NO_VAL
+            if req.overcommit and req.overcommit != <uint8_t>slurm.NO_VAL:
+                print("--overcommit is not supported on Cray/ALPS systems.")
+                req.overcommit = False
+            if req.wait_all_nodes and req.wait_all_nodes != <uint16_t>slurm.NO_VAL:
+                print("--wait-all-nodes is handled automatically on Cray/ALPS systems.")
+                req.wait_all_nodes = <uint16_t>slurm.NO_VAL
+        return rc
+
+    def submit_batch_job(self, job_opts):
+        """Submit batch job.
+
+        Make sure options match sbatch command line opts and not struct member
+        names.
+
+        Args:
+            job_opts (dict): Job information.
+
+        Returns:
+            (int): The job id of the submitted job.
+        """
+        cdef:
+            slurm.job_desc_msg_t desc
+            slurm.submit_response_msg_t *resp
+            #slurm.slurmdb_cluster_rec_t *working_cluster_rec = NULL
+            int rc = 0
+            int fill_job_desc_rc
+            int retries = 0
+            int error_exit = 1
+
+
+        # _set_exit_code()
+        val = os.environ.get("SLURM_EXIT_ERROR")
+        if val:
+            if int(val) == 0:
+                sys.stderr.write("SLURM_EXIT_ERROR has zero value")
+                sys.exit(slurm.SLURM_ERROR)
+            else:
+                error_exit = int(val)
+
+        # script_name = process_options_first_pass() -> calls _opt_default(true)
+        # possibly not needed here in the API
+
+        if job_opts.get("wrap"):
+            # _script_wrap
+            wrap_script = "#!/bin/bash\n"
+            wrap_script += "# This script was create by PySlurm.\n\n"
+            wrap_script += job_opts.get("wrap")
+            script_body = wrap_script.encode("UTF-8", "replace")
+        elif job_opts.get("script"):
+            # _get_script_buffer
+            with open(job_opts.get("script"), "r") as script:
+                script_body = script.read()
+                if len(script_body) == 0:
+                    raise ValueError("Batch script is empty!")
+                elif script_body.isspace():
+                    raise ValueError("Batch script contains only whitespace!.")
+                elif not script_body.startswith("#!"):
+                    msg = "This does not look like a batch script.  The first"
+                    msg += " line must start with #! followed by the path"
+                    msg += " to an interpreter."
+                    raise ValueError(msg)
+                elif "\x00" in script_body:
+                    # TODO: should this be \0 or \x00, are these the same in Python?
+                    msg = "The SLURM controller does not allow scripts that"
+                    msg += " contain a NULL character '\\0'."
+                    raise ValueError(msg)
+                elif "\r\n" in script_body:
+                    msg = "Batch script contains DOS line breaks (\\r\\n)"
+                    msg += " instead of expected UNIX line breaks (\\n)."
+                    raise ValueError(msg)
+            script_body = script_body.encode("UTF-8", "replace")
+        elif job_opts.get("script") is None:
+            sys.exit(1)
+
+        # process_options_second_pass
+        #   - _opt_default(first_pass)
+        #   - _opt_batch_script( )
+        #   - _opt_env()
+        #   - _opt_verify()
+        #   - _opt_list ??
+        # add burst buffer to script
+        # spank_init_post_opt
+        # check get_user_env_time
+        #   - _set_rlimit_env()
+
+        if job_opts.get("export_file"):
+            # if the environment is coming from a file, the
+            # environment at execution startup must be unset
+            os.environ.clear()
+
+        # _set_prio_process_env();
+        errno = 0
+        retval = 0
+        retval = getpriority(PRIO_PROCESS, 0)
+        if retval == -1:
+            if errno:
+                raise ValueError("getpriority(PRIO_PROCESS): %m")
+
+        try:
+            os.environ["SLURM_PRIO_PROCESS"] = str(retval)
+        except:
+            raise ValueError("unable to set SLURM_PRIO_PROCESS in environment")
+
+        # _set_spank_env();
+
+        # _set_submit_dir_env();
+        try:
+            os.environ["SLURM_SUBMIT_DIR"] = os.getcwd()
+        except:
+            raise ValueError("unable to set SLURM_SUBMIT_DIR in environment")
+
+        try:
+            os.environ["SLURM_SUBMIT_HOST"] = gethostname()
+        except:
+            raise ValueError("unable to set SLURM_SUBMIT_HOST in environment")
+
+        # _set_umask_env();
+        if not os.environ.get("SLURM_UMASK"):
+            mask = os.umask(0)
+            _ = os.umask(mask)
+            try:
+                os.environ["SLURM_UMASK"] = "0" + str((mask>>6)&07) + str((mask>>3)&07) + str(mask&07)
+            except:
+                raise ValueError("unable to set SLURM_UMASK in environment")
+
+        # slurm_init_job_desc_msg(&desc)
+        slurm.slurm_init_job_desc_msg(&desc)
+        fill_job_desc_rc = self.fill_job_desc_from_opts(job_opts, &desc)
+
+        if fill_job_desc_rc == -1:
+            sys.exit(error_exit)
+
+        desc.script = script_body
+
+        # If can run on multiple clusters, find the earliest run time
+        # and run it there
+        if job_opts.get("clusters"):
+            clusters = job_opts.get("clusters").encode("UTF-8", "replace")
+            desc.clusters = clusters
+            if slurm.slurmdb_get_first_avail_cluster(&desc, clusters,
+                &slurm.working_cluster_rec) != slurm.SLURM_SUCCESS:
+                    self.print_db_notok(clusters, 0)
+                    sys.exit(error_exit)
+
+        if self._check_cluster_specific_settings(&desc) != slurm.SLURM_SUCCESS:
+            sys.exit(error_exit)
+
+
+        if job_opts.get("test_only"):
+            if slurm.slurm_job_will_run(&desc) != slurm.SLURM_SUCCESS:
+                slurm.slurm_perror("allocation failure")
+                sys.exit(1)
+            sys.exit(0)
+
+        while slurm.slurm_submit_batch_job(&desc, &resp) < 0:
+            if errno == slurm.ESLURM_ERROR_ON_DESC_TO_RECORD_COPY:
+                msg = "Slurm job queue full, sleeping and retrying."
+            elif errno == slurm.ESLURM_NODES_BUSY:
+                msg = "Job step creation temporarily disabled, retrying"
+            elif errno == EAGAIN:
+                msg = "Slurm temporarily unable to accept job, sleeping and retrying."
+            else:
+                msg = None
+
+            if msg is None or retries >= MAX_RETRIES:
+                raise ValueError("Batch job submission failed: %s", msg)
+
+#            if retries:
+            retries += 1
+            p_time.sleep(retries)
+
+        job_id = resp.step_id.job_id
+        slurm.slurm_free_submit_response_response_msg(resp)
+
+        #return "Submitted batch job %s" % job_id
+        return job_id
+
+    def wait_finished(self, jobid):
+        """Block until the job given by the jobid finishes.
+
+        This works for single jobs, as well as job arrays.
+
+        Args:
+            jobid (int): The job id of the slurm job.
+                To reference a job with job array set, use the first/"master"
+                jobid (the same as given by squeue)
+
+        Returns:
+            (int): The exit code of the slurm job.
+        """
+        exit_status = -9999
+        complete = False
+        while not complete:
+            complete = True
+            p_time.sleep(5)
+            self._load_single_job(jobid)
+            for i in range(0, self._job_ptr.record_count):
+                self._record = &self._job_ptr.job_array[i]
+                if IS_JOB_COMPLETED(self._job_ptr.job_array[i]):
+                    exit_status_arrayjob = None
+                    if WIFEXITED(self._record.exit_code):
+                        exit_status_arrayjob = WEXITSTATUS(self._record.exit_code)
+                    else:
+                        exit_status_arrayjob = 1
+                    # set exit code to the highest of all jobs in job array
+                    exit_status = max([exit_status, exit_status_arrayjob])
+                else:
+                    # go on with the next iteration, unil all jobs in array are completed
+                    complete = False
+            slurm.slurm_free_job_info_msg(self._job_ptr)
+        return exit_status
+
+
+def slurm_pid2jobid(uint32_t JobPID=0):
+    """Get the slurm job id from a process id.
+
+    Args:
+        JobPID (int): Job process id
+
+    Returns:
+        int: 0 for success or a slurm error code
+    """
+    cdef:
+        uint32_t JobID = 0
+        int apiError = 0
+        int errCode = slurm.slurm_pid2jobid(JobPID, &JobID)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode, JobID
+
+
+cdef secs2time_str(uint32_t time):
+    """Convert seconds to Slurm string format.
+
+    This method converts time in seconds (86400) to Slurm's string format
+    (1-00:00:00).
+
+    Args:
+        time (int): Time in seconds
+
+    Returns:
+        str: Slurm time string.
+    """
+    cdef:
+        char *time_str
+        double days, hours, minutes, seconds
+
+    if time == slurm.INFINITE:
+        time_str = "UNLIMITED"
+    else:
+        seconds = time % 60
+        minutes = (time / 60) % 60
+        hours = (time / 3600) % 24
+        days = time / 86400
+
+        if days < 0 or  hours < 0 or minutes < 0 or seconds < 0:
+            time_str = "INVALID"
+        elif days:
+            return "%ld-%2.2ld:%2.2ld:%2.2ld" % (days, hours,
+                                                  minutes, seconds)
+        else:
+            return "%2.2ld:%2.2ld:%2.2ld" % (hours, minutes, seconds)
+
+
+cdef mins2time_str(uint32_t time):
+    """Convert minutes to Slurm string format.
+
+    This method converts time in minutes (14400) to Slurm's string format
+    (10-00:00:00).
+
+    Args:
+        time (int): Time in minutes
+
+    Returns:
+        str: Slurm time string.
+    """
+    cdef:
+        double days, hours, minutes, seconds
+
+    if time == slurm.INFINITE:
+        return "UNLIMITED"
+    else:
+        seconds = 0
+        minutes = time % 60
+        hours = (time / 60) % 24
+        days = time / 1440
+
+        if days < 0 or  hours < 0 or minutes < 0 or seconds < 0:
+            time_str = "INVALID"
+        elif days:
+            return "%ld-%2.2ld:%2.2ld:%2.2ld" % (days, hours,
+                                                  minutes, seconds)
+        else:
+            return "%2.2ld:%2.2ld:%2.2ld" % (hours, minutes, seconds)
+
+
+#
+# Slurm Error Class
+#
+
+
+class SlurmError(Exception):
+
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return repr(slurm.slurm_strerror(self.value))
+
+
+#
+# Slurm Error Functions
+#
+
+
+def slurm_get_errno():
+    """Return the slurm error as set by a slurm API call.
+
+    Returns:
+        (int): Current slurm error number
+    """
+    return errno
+
+
+def slurm_strerror(int Errno=0):
+    """Return slurm error message represented by a given slurm error number.
+
+    Args:
+        Errno (int): slurm error number.
+
+    Returns:
+        (str): slurm error string
+    """
+    cdef char* errMsg = slurm.slurm_strerror(Errno)
+
+    return "%s" % errMsg
+
+
+def slurm_perror(char* Msg=''):
+    """Print to standard error the supplied header.
+
+    Header is followed by a colon, followed by a text description of the last
+    Slurm error code generated.
+
+    Args:
+        Msg (str): slurm program error String
+    """
+    slurm.slurm_perror(Msg)
+
+
+#
+# Hostlist Class
+#
+
+
+cdef class hostlist:
+    """Wrapper for Slurm hostlist functions."""
+
+    cdef slurm.hostlist_t *hl
+
+    def __cinit__(self):
+        self.hl = NULL
+
+    def __dealloc__(self):
+        self.destroy()
+
+    def create(self, hostnames=None):
+        if not hostnames:
+            self.hl = slurm.slurm_hostlist_create(NULL)
+        else:
+            b_hostnames = hostnames.encode("UTF-8")
+            self.hl = slurm.slurm_hostlist_create(b_hostnames)
+        if not self.hl:
+            raise ValueError("No memory")
+        else:
+            return True
+
+    def destroy(self):
+        if self.hl is not NULL:
+            slurm.slurm_hostlist_destroy(self.hl)
+            self.hl = NULL
+
+    def count(self):
+        return slurm.slurm_hostlist_count(self.hl)
+
+    def get_list(self):
+        """Get the list of hostnames composing the hostlist.
+
+        For example with a hostlist created with "tux[1-3]" -> [ 'tux1',
+        tux2', 'tux3' ].
+
+        Returns:
+            (list): The list of hostnames in case of success or None on error.
+        """
+        cdef:
+            slurm.hostlist_t *hlist = NULL
+            char *hostlist_s = NULL
+            char *tmp_str = NULL
+            list host_list = None
+            unsigned int nb_hosts
+            unsigned int host_index
+
+        py_string = ''
+
+        if self.hl is not NULL:
+            # make a copy of self.hl since slurm.slurm_hostlist_shift() is destructive.
+            tmp_str = slurm.slurm_hostlist_ranged_string_xmalloc(self.hl)
+            if tmp_str is not NULL:
+                hlist = slurm.slurm_hostlist_create(tmp_str)
+                nb_hosts = slurm.slurm_hostlist_count(hlist)
+                host_list = []
+                for host_index in range(nb_hosts):
+                    hostlist_s = slurm.slurm_hostlist_shift(hlist)
+                    py_string = hostlist_s
+                    free(hostlist_s)
+                    host_list.append(py_string)
+
+                slurm.xfree(tmp_str)
+                slurm.slurm_hostlist_destroy(hlist)
+
+        return host_list
+
+    def get(self):
+        cdef:
+            char *hostlist_s = NULL
+            char *tmp_str = NULL
+
+        py_string = None
+        if self.hl is not NULL:
+            tmp_str = slurm.slurm_hostlist_ranged_string_xmalloc(self.hl)
+            if tmp_str is not NULL:
+                hostlist_s = <char *>malloc(strlen(tmp_str) + 1)
+                strcpy(hostlist_s, tmp_str)
+                py_string = hostlist_s
+                free(hostlist_s)
+                slurm.xfree(tmp_str)
+
+        return py_string
+
+    def ranged_string(self):
+        if self.hl is not NULL:
+            return stringOrNone(slurm.slurm_hostlist_ranged_string_xmalloc(self.hl), '')
+
+    def find(self, hostname):
+        if self.hl is not NULL:
+            b_hostname = hostname.encode("UTF-8")
+            return slurm.slurm_hostlist_find(self.hl, b_hostname)
+
+    def pop(self):
+        if self.hl is not NULL:
+            return stringOrNone(slurm.slurm_hostlist_shift(self.hl), '')
+
+    def shift(self):
+        return self.pop()
+
+    def push(self, hosts):
+        if self.hl is not NULL:
+            b_hosts = hosts.encode("UTF-8")
+            return slurm.slurm_hostlist_push(self.hl, b_hosts)
+
+    def push_host(self, host):
+        if self.hl is not NULL:
+            b_host = host.encode("UTF-8")
+            return slurm.slurm_hostlist_push_host(self.hl, b_host)
+
+    def uniq(self):
+        if self.hl is not NULL:
+            slurm.slurm_hostlist_uniq(self.hl)
+
+
+#
+# Trigger Get/Set/Update Class
+#
+
+
+cdef class trigger:
+
+    def set(self, dict trigger_dict):
+        """Set or create a slurm trigger.
+
+        Args:
+            trigger_dict (dict): A populated dictionary of trigger information
+
+        Returns:
+            (int): 0 for success or -1 for error, and the slurm error code is
+                set appropriately.
+        """
+        cdef:
+            slurm.trigger_info_t trigger_set
+            int errCode = -1
+
+        slurm.slurm_init_trigger_msg(&trigger_set)
+
+        if 'jobid' in trigger_dict:
+            JobId = trigger_dict['jobid']
+            trigger_set.res_type = TRIGGER_RES_TYPE_JOB  # 1
+
+            if isinstance(JobId, int):
+                JobId = str(JobId)
+
+            b_JobId = JobId.encode("UTF-8")
+            trigger_set.res_id = b_JobId
+
+            if 'fini' in trigger_dict:
+                trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_FINI  # 0x0010
+            if 'offset' in trigger_dict:
+                trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_TIME  # 0x0008
+
+        elif 'node' in trigger_dict:
+            trigger_set.res_type = TRIGGER_RES_TYPE_NODE
+            if trigger_dict['node'] == '':
+                trigger_set.res_id = '*'
+            else:
+                b_node = trigger_dict['node'].encode("UTF-8")
+                trigger_set.res_id = b_node
+
+        trigger_set.offset = 0x8000
+        if 'offset' in trigger_dict:
+            trigger_set.offset = trigger_set.offset + trigger_dict['offset']
+
+        b_program = trigger_dict['program'].encode("UTF-8")
+        trigger_set.program = b_program
+
+        event = trigger_dict['event']
+        if event == 'burst_buffer':
+            trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_BURST_BUFFER
+
+        if event == 'drained':
+            trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_DRAINED    # 0x0100
+
+        if event == 'down':
+            trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_DOWN       # 0x0002
+
+        if event == 'fail':
+            trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_FAIL       # 0x0004
+
+        if event == 'up':
+            trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_UP         # 0x0001
+
+        if event == 'idle':
+            trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_IDLE       # 0x0080
+
+        if event == 'reconfig':
+            trigger_set.trig_type = trigger_set.trig_type | TRIGGER_TYPE_RECONFIG   # 0x0020
+
+        while slurm.slurm_set_trigger(&trigger_set):
+            slurm.slurm_perror('slurm_set_trigger')
+            # EAGAIN
+            if slurm_get_errno() != 11:
+                errCode = slurm_get_errno()
+                return errCode
+
+            p_time.sleep(5)
+
+        return 0
+
+    def get(self):
+        """Get the information on slurm triggers.
+
+        Returns:
+            (dict): Dictionary, where keys are the trigger IDs
+        """
+        cdef:
+            slurm.trigger_info_msg_t *trigger_get = NULL
+            int errCode = slurm.slurm_get_triggers(&trigger_get)
+            dict Triggers = {}, Trigger_dict
+
+        if errCode == 0:
+            for record in trigger_get.trigger_array[:trigger_get.record_count]:
+                trigger_id = record.trig_id
+
+                Trigger_dict = {}
+                Trigger_dict['flags'] = record.flags
+                Trigger_dict['trig_id'] = trigger_id
+                Trigger_dict['res_type'] = record.res_type
+                Trigger_dict['res_id'] = stringOrNone(record.res_id, '')
+                Trigger_dict['trig_type'] = record.trig_type
+                Trigger_dict['offset'] = record.offset - 0x8000
+                Trigger_dict['user_id'] = record.user_id
+                Trigger_dict['program'] = stringOrNone(record.program, '')
+
+                Triggers[trigger_id] = Trigger_dict
+
+            slurm.slurm_free_trigger_msg(trigger_get)
+
+        return Triggers
+
+    def clear(self, TriggerID=0, UserID=slurm.NO_VAL, ID=0):
+        """Clear or remove a slurm trigger.
+
+        Args:
+            TriggerID (str): Trigger Identifier
+            UserID (str): User Identifier
+            ID (str): Job Identifier
+
+        Returns:
+            (int): 0 for success or a slurm error code
+        """
+        cdef:
+            slurm.trigger_info_t trigger_clear
+            int errCode
+
+        if not (TriggerID or UserID or ID):
+            raise ValueError("One of `TriggerID` or `UserID` or `ID` must be provided.")
+
+        trigger_clear.trig_id = TriggerID
+        trigger_clear.user_id = UserID
+
+        if ID:
+            trigger_clear.res_type = TRIGGER_RES_TYPE_JOB  # 1
+            b_job_id = str(ID).encode("UTF-8")
+            trigger_clear.res_id = b_job_id
+
+        errCode = slurm.slurm_clear_trigger(&trigger_clear)
+
+        if errCode != slurm.SLURM_SUCCESS:
+            raise ValueError(stringOrNone(slurm.slurm_strerror(errCode), ''), errCode)
+
+        return errCode
+
+
+#
+# Reservation Class
+#
+
+
+cdef class reservation:
+    """Access/update/delete slurm reservation Information."""
+
+    cdef:
+        slurm.reserve_info_msg_t *_Res_ptr
+        slurm.time_t _lastUpdate
+        uint16_t _ShowFlags
+        dict _ResDict
+
+    def __cinit__(self):
+        self._Res_ptr = NULL
+        self._lastUpdate = 0
+        self._ShowFlags = 0
+        self._ResDict = {}
+
+    def __dealloc__(self):
+        self.__free()
+
+    def lastUpdate(self):
+        """Get the time (epoch seconds) the reservation data was updated.
+
+        Returns:
+            (int): epoch seconds
+        """
+        return self._lastUpdate
+
+    def ids(self):
+        """Return a list of reservation IDs from retrieved data.
+
+        Returns:
+            (dict): Dictionary of reservation IDs
+        """
+        return self._ResDict.keys()
+
+    def find_id(self, resID):
+        """Retrieve reservation ID data.
+
+        Args:
+            resID (str): Reservation key string to search
+
+        Returns:
+            (dict): Dictionary of values for given reservation key
+        """
+        return self._ResDict.get(resID, {})
+
+    def find(self, name='', val=''):
+        """Search for property and associated value in reservation data.
+
+        Args:
+            name (str): key string to search
+            val (str): value string to match
+
+        Returns:
+            (list): List of IDs that match
+        """
+
+        # [ key for key, value in self._ResDict.items() if self._ResDict[key]['state'] == 'error']
+        cdef list retList = []
+
+        if val != '':
+            for key, value in self._ResDict.items():
+                if self._ResDict[key][name] == val:
+                    retList.append(key)
+        return retList
+
+    def load(self):
+        self.__load()
+
+    cdef int __load(self) except? -1:
+        """Load slurm reservation information."""
+        cdef:
+            slurm.reserve_info_msg_t *new_reserve_info_ptr = NULL
+            slurm.time_t last_time = <slurm.time_t>NULL
+            int apiError = 0, errCode = 0
+
+        if self._Res_ptr is not NULL:
+
+            errCode = slurm.slurm_load_reservations(self._Res_ptr.last_update,
+                                                    &new_reserve_info_ptr)
+            if errCode == slurm.SLURM_SUCCESS:
+                slurm.slurm_free_reservation_info_msg(self._Res_ptr)
+            elif slurm_get_errno() == 1900:   # SLURM_NO_CHANGE_IN_DATA
+                errCode = 0
+                new_reserve_info_ptr = self._Res_ptr
+        else:
+            last_time = <time_t>NULL
+            errCode = slurm.slurm_load_reservations(last_time, &new_reserve_info_ptr)
+
+        if errCode == 0:
+            self._Res_ptr = new_reserve_info_ptr
+            self._lastUpdate = self._Res_ptr.last_update
+        else:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+        return errCode
+
+    cdef __free(self):
+        """Free slurm reservation pointer."""
+
+        if self._Res_ptr is not NULL:
+            slurm.slurm_free_reservation_info_msg(self._Res_ptr)
+
+    def get(self):
+        """Get slurm reservation information.
+
+        Returns:
+            (dict): Data whose key is the Reservation ID
+        """
+        self.load()
+        self.__get()
+
+        return self._ResDict
+
+    cdef __get(self):
+        cdef:
+            dict Reservations = {}
+            dict Res_dict
+
+        if self._Res_ptr is not NULL:
+
+            for record in self._Res_ptr.reservation_array[:self._Res_ptr.record_count]:
+
+                name = stringOrNone(record.name, '')
+
+                Res_dict = {}
+                Res_dict['accounts'] = listOrNone(record.accounts, ',')
+                Res_dict['burst_buffer'] = listOrNone(record.burst_buffer, ',')
+                Res_dict['core_cnt'] = record.core_cnt
+                Res_dict['end_time'] = record.end_time
+                Res_dict['features'] = stringOrNone(record.features, '')
+
+                flags = slurm.slurm_reservation_flags_string(&record)
+                Res_dict['flags'] = stringOrNone(flags, '')
+
+                Res_dict['licenses'] = __get_licenses(record.licenses)
+                Res_dict['node_cnt'] = record.node_cnt
+                Res_dict['node_list'] = stringOrNone(record.node_list, '')
+                Res_dict['partition'] = stringOrNone(record.partition, '')
+                Res_dict['start_time'] = record.start_time
+                Res_dict['tres_str'] = listOrNone(record.tres_str, ',')
+                Res_dict['users'] = listOrNone(record.users, ',')
+
+                Reservations[name] = Res_dict
+
+        self._ResDict = Reservations
+
+    def create(self, dict reservation_dict={}):
+        """Create slurm reservation.
+
+        Args:
+            reservation_dict (dict): Reservation information
+
+        Returns:
+            (int): 0 for success or a slurm error code
+        """
+        return slurm_create_reservation(reservation_dict)
+
+    def delete(self, ResID):
+        """Delete slurm reservation.
+
+        Args:
+            ResID (int): ID of the reservation to delete
+
+        Returns:
+            (int): 0 for success or a slurm error code
+        """
+        return slurm_delete_reservation(ResID)
+
+    def update(self, dict reservation_dict={}):
+        """Update a slurm reservation attributes.
+
+        Args:
+            reservation_dict (dict): Reservation information
+
+        Returns:
+            (int): 0 for success or -1 for error and slurm error code is set
+        """
+        return slurm_update_reservation(reservation_dict)
+
+    def print_reservation_info_msg(self, int oneLiner=0):
+        """Output information about all slurm reservations.
+
+        Args:
+            oneLiner (int, optional): Print reservation info in one-line
+        """
+        if self._Res_ptr is not NULL:
+            slurm.slurm_print_reservation_info_msg(slurm.stdout, self._Res_ptr, oneLiner)
+
+
+#
+# Reservation Helper Functions
+#
+
+
+def slurm_create_reservation(dict reservation_dict={}):
+    """Create a slurm reservation.
+
+    Args:
+        reservation_dict (dict): A populated reservation dictionary, an empty
+            one is created by create_reservation_dict
+
+    Returns:
+        (str): The name of the reservation created.
+    """
+    cdef:
+        slurm.resv_desc_msg_t resv_msg
+        char *resid = NULL
+        int int_value = 0
+        int free_users = 0
+        int free_accounts = 0
+        unsigned int uint32_value
+        slurm.time_t time_value
+
+    slurm.slurm_init_resv_desc_msg(&resv_msg)
+
+    resv_msg.start_time = reservation_dict['start_time']
+
+    if not (reservation_dict.get('duration') or reservation_dict.get('end_time')):
+        raise ValueError("You must provide either duration or end_time.")
+
+    if (reservation_dict.get('duration') and reservation_dict.get('end_time')):
+        raise ValueError("You must provide either duration or end_time.")
+
+    if reservation_dict.get('duration'):
+        resv_msg.duration = reservation_dict['duration']
+
+    if reservation_dict.get('end_time'):
+        resv_msg.end_time = reservation_dict['end_time']
+
+    if reservation_dict.get('node_cnt'):
+        resv_msg.node_cnt = <uint32_t>reservation_dict['node_cnt']
+
+    if reservation_dict.get('core_cnt') and not reservation_dict.get('node_list'):
+        resv_msg.core_cnt = <uint32_t>reservation_dict['core_cnt'][0]
+
+    if reservation_dict.get('node_list'):
+        b_node_list = reservation_dict['node_list'].encode("UTF-8", "replace")
+        resv_msg.node_list = b_node_list
+        if reservation_dict.get('core_cnt'):
+            hl = hostlist()
+            hl.create(b_node_list)
+            if len(reservation_dict['core_cnt']) != hl.count():
+                raise ValueError("core_cnt list must have the same # elements as the expanded hostlist")
+            resv_msg.core_cnt = <uint32_t>len(reservation_dict['core_cnt'])
+
+    if reservation_dict.get('users'):
+        b_users = reservation_dict['users'].encode("UTF-8", "replace")
+        resv_msg.users = b_users
+
+    if reservation_dict.get('features'):
+        b_features = reservation_dict['features'].encode("UTF-8", "replace")
+        resv_msg.features = b_features
+
+    if reservation_dict.get('accounts'):
+        b_accounts = reservation_dict['accounts'].encode("UTF-8", "replace")
+        resv_msg.accounts = b_accounts
+
+    if reservation_dict.get('licenses'):
+        b_licenses = reservation_dict['licenses'].encode("UTF-8")
+        resv_msg.licenses = b_licenses
+
+    if reservation_dict.get('flags'):
+        int_value = reservation_dict['flags']
+        resv_msg.flags = int_value
+
+    if reservation_dict.get('partition'):
+        b_name = reservation_dict['partition'].encode("UTF-8")
+        resv_msg.partition = b_name
+
+    if reservation_dict.get('name'):
+        b_name = reservation_dict['name'].encode("UTF-8")
+        resv_msg.name = b_name
+
+    resid = slurm.slurm_create_reservation(&resv_msg)
+
+    resID = ''
+    if resid is not NULL:
+        resID = stringOrNone(resid, '')
+        free(resid)
+    else:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return resID
+
+def slurm_update_reservation(dict reservation_dict={}):
+    """Update a slurm reservation.
+
+    Args:
+        reservation_dict (dict): A populated reservation dictionary, an empty
+            one is created by create_reservation_dict
+
+    Returns:
+        (int): 0 for success or -1 for error, and the slurm error code is set
+            appropriately.
+    """
+    cdef:
+        slurm.resv_desc_msg_t resv_msg
+        char* name = NULL
+        int free_users = 0, free_accounts = 0, errCode = 0
+        uint32_t uint32_value
+        slurm.time_t time_value
+
+    slurm.slurm_init_resv_desc_msg(&resv_msg)
+
+    # Be careful: Updating the start_time fails, if the previous start_time
+    # of the reservation is in the past.
+    # Set reservation_dict['start_time'] = -1 to handle this case.
+    if reservation_dict.get('start_time'):
+        time_value = reservation_dict.get('start_time')
+        if time_value != -1:
+            resv_msg.start_time = time_value
+
+    if reservation_dict.get('end_time'):
+        resv_msg.end_time = reservation_dict['end_time']
+
+    if reservation_dict.get('duration'):
+        resv_msg.duration = reservation_dict.get('duration')
+
+    if reservation_dict.get('name'):
+        b_name = reservation_dict['name'].encode("UTF-8", "replace")
+        resv_msg.name = b_name
+
+    if reservation_dict.get('node_cnt'):
+        resv_msg.node_cnt = <uint32_t>reservation_dict['node_cnt']
+
+    if reservation_dict.get('core_cnt') and not reservation_dict.get('node_list'):
+        resv_msg.core_cnt = <uint32_t>reservation_dict['core_cnt'][0]
+
+    if reservation_dict.get('node_list'):
+        b_node_list = reservation_dict['node_list']
+        resv_msg.node_list = b_node_list
+        if reservation_dict.get('core_cnt'):
+            hl = hostlist()
+            hl.create(b_node_list)
+            if len(reservation_dict['core_cnt']) != hl.count():
+                raise ValueError("core_cnt list must have the same # elements as the expanded hostlist")
+            resv_msg.core_cnt = <uint32_t>len(reservation_dict['core_cnt'])
+
+    if reservation_dict.get('users'):
+        b_users = reservation_dict['users'].encode("UTF-8", "replace")
+        resv_msg.users = b_users
+
+    if reservation_dict.get('features'):
+        b_features = reservation_dict['features'].encode("UTF-8", "replace")
+        resv_msg.features = b_features
+
+    if reservation_dict.get('accounts'):
+        b_accounts = reservation_dict['accounts'].encode("UTF-8", "replace")
+        resv_msg.accounts = b_accounts
+
+    if reservation_dict.get('licenses'):
+        b_licenses = reservation_dict['licenses'].encode("UTF-8")
+        resv_msg.licenses = b_licenses
+
+    if reservation_dict.get('partition'):
+        b_name = reservation_dict['partition'].encode("UTF-8")
+        resv_msg.partition = b_name
+
+    if reservation_dict.get('flags'):
+        int_value = reservation_dict['flags']
+        resv_msg.flags = int_value
+
+    errCode = slurm.slurm_update_reservation(&resv_msg)
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+def slurm_delete_reservation(ResID):
+    """Delete a slurm reservation.
+
+    Args:
+        ResID (str): Reservation Identifier
+
+    Returns:
+        (int): 0 for success or -1 for error, and the slurm error code is set
+            appropriately.
+    """
+    cdef slurm.reservation_name_msg_t resv_msg
+
+    if not ResID:
+        return -1
+
+    b_resid = ResID.encode("UTF-8", "replace")
+    resv_msg.name = b_resid
+
+    cdef int apiError = 0
+    cdef int errCode = slurm.slurm_delete_reservation(&resv_msg)
+
+    if errCode != 0:
+        apiError = slurm_get_errno()
+        raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    return errCode
+
+
+def create_reservation_dict():
+    """Create and empty dict for use with create_reservation method.
+
+    Returns a dictionary that can be populated by the user an used for
+    the update_reservation and create_reservation calls.
+
+    Returns:
+        (dict): Empty Reservation dictionary
+    """
+    return {
+        'start_time': 0,
+        'end_time': 0,
+        'duration': None,
+        'node_cnt': 0,
+        'name': None,
+        'node_list': None,
+        'features': None,
+        'flags': None,
+        'partition': None,
+        'licenses': None,
+        'users': None,
+        'accounts': None
+    }
+
+
+#
+# QOS Class
+#
+
+
+cdef class qos:
+    """Access/update slurm QOS information."""
+
+    cdef:
+        void *dbconn
+        dict _QOSDict
+        slurm.list_t *_QOSList
+
+    def __cinit__(self):
+        self.dbconn = <void *>NULL
+        self._QOSDict = {}
+
+    def __dealloc__(self):
+        self.__destroy()
+
+    cdef __destroy(self):
+        """QOS Destructor method."""
+        self._QOSDict = {}
+
+    def load(self):
+        """Load slurm QOS information."""
+        self.__load()
+
+    cdef int __load(self) except? -1:
+        """Load slurm QOS list."""
+        cdef:
+            slurm.slurmdb_qos_cond_t *new_qos_cond = NULL
+            int apiError = 0
+            void* dbconn = slurm.slurmdb_connection_get(NULL)
+            slurm.list_t *QOSList = slurm.slurmdb_qos_get(dbconn, new_qos_cond)
+
+        if QOSList is NULL:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+        else:
+            self._QOSList = QOSList
+
+        slurm.slurmdb_connection_close(&dbconn)
+        return 0
+
+    def lastUpdate(self):
+        """Return last time (sepoch seconds) the QOS data was updated.
+
+        Returns:
+            int: epoch seconds
+        """
+        return self._lastUpdate
+
+    def ids(self):
+        """Return the QOS IDs from retrieved data.
+
+        Returns:
+            (dict): Dictionary of QOS IDs
+        """
+        return self._QOSDict.keys()
+
+    def get(self):
+        """Get slurm QOS information.
+
+        Returns:
+            (dict): Dictionary whose key is the QOS ID
+        """
+        self.__load()
+        self.__get()
+
+        return self._QOSDict
+
+    cdef __get(self):
+        cdef:
+            slurm.list_t *qos_list = NULL
+            slurm.list_itr_t *iters = NULL
+            int i = 0
+            int listNum = 0
+            dict Q_dict = {}
+
+        if self._QOSList is not NULL:
+            listNum = slurm.slurm_list_count(self._QOSList)
+            iters = slurm.slurm_list_iterator_create(self._QOSList)
+
+            for i in range(listNum):
+                qos = <slurm.slurmdb_qos_rec_t *>slurm.slurm_list_next(iters)
+                name = stringOrNone(qos.name, '')
+
+                # QOS infos
+                QOS_info = {}
+
+                if name:
+                    QOS_info['description'] = stringOrNone(qos.description, '')
+                    QOS_info['flags'] = qos.flags
+                    QOS_info['grace_time'] = qos.grace_time
+                    QOS_info['grp_jobs'] = qos.grp_jobs
+                    QOS_info['grp_submit_jobs'] = qos.grp_submit_jobs
+                    QOS_info['grp_tres'] = stringOrNone(qos.grp_tres, '')
+                    # QOS_info['grp_tres_ctld']
+                    QOS_info['grp_tres_mins'] = stringOrNone(qos.grp_tres_mins, '')
+                    # QOS_info['grp_tres_mins_ctld']
+                    QOS_info['grp_tres_run_mins'] = stringOrNone(qos.grp_tres_run_mins, '')
+                    # QOS_info['grp_tres_run_mins_ctld']
+                    QOS_info['grp_wall'] = qos.grp_wall
+                    QOS_info['max_jobs_pu'] = qos.max_jobs_pu
+                    QOS_info['max_submit_jobs_pu'] = qos.max_submit_jobs_pu
+                    QOS_info['max_tres_mins_pj'] = stringOrNone(qos.max_tres_mins_pj, '')
+                    # QOS_info['max_tres_min_pj_ctld']
+                    QOS_info['max_tres_pj'] = stringOrNone(qos.max_tres_pj, '')
+                    # QOS_info['max_tres_min_pj_ctld']
+                    QOS_info['max_tres_pn'] = stringOrNone(qos.max_tres_pn, '')
+                    # QOS_info['max_tres_min_pn_ctld']
+                    QOS_info['max_tres_pu'] = stringOrNone(qos.max_tres_pu, '')
+                    # QOS_info['max_tres_min_pu_ctld']
+                    QOS_info['max_tres_run_mins_pu'] = stringOrNone(
+                        qos.max_tres_run_mins_pu, '')
+
+                    QOS_info['max_wall_pj'] = qos.max_wall_pj
+                    QOS_info['min_tres_pj'] = stringOrNone(qos.min_tres_pj, '')
+                    # QOS_info['min_tres_pj_ctld']
+                    QOS_info['name'] = name
+                    # QOS_info['*preempt_bitstr'] =
+                    # QOS_info['preempt_list'] = qos.preempt_list
+
+                    qos_preempt_mode = get_preempt_mode(qos.preempt_mode)
+                    QOS_info['preempt_mode'] = stringOrNone(qos_preempt_mode, '')
+
+                    QOS_info['priority'] = qos.priority
+                    QOS_info['usage_factor'] = qos.usage_factor
+                    QOS_info['usage_thres'] = qos.usage_thres
+
+                    # NB - Need to add code to decode types of grp_tres_ctld (uint64t list) etc
+
+                if name:
+                    Q_dict[name] = QOS_info
+
+            slurm.slurm_list_iterator_destroy(iters)
+            slurm.slurm_list_destroy(self._QOSList)
+
+        self._QOSDict = Q_dict
+
+#
+# slurmdbd jobs Class
+#
+cdef class slurmdb_jobs:
+    """Access Slurmdbd Jobs information."""
+    cdef:
+        void* db_conn
+        slurm.slurmdb_job_cond_t *job_cond
+
+    def __cinit__(self):
+        self.job_cond = <slurm.slurmdb_job_cond_t *>xmalloc(sizeof(slurm.slurmdb_job_cond_t))
+        self.db_conn = slurm.slurmdb_connection_get(NULL)
+
+    def __dealloc__(self):
+        slurm.xfree(self.job_cond)
+        slurm.slurmdb_connection_close(&self.db_conn)
+
+    def get(self, jobids=[], userids=[], starttime=0, endtime=0, flags = None,
+            db_flags = None, clusters = []):
+        """Get Slurmdb information about some jobs.
+
+        Input formats for start and end times:
+            *   today or tomorrow
+            *   midnight, noon, teatime (4PM)
+            *   HH:MM [AM|PM]
+            *   MMDDYY or MM/DD/YY or MM.DD.YY
+            *   YYYY-MM-DD[THH[:MM[:SS]]]
+            *   now + count [minutes | hours | days | weeks]
+            *
+
+        Invalid time input results in message to stderr and return value of
+        zero.
+
+        Args:
+            jobids (list): Ids of the jobs to search. Defaults to all jobs.
+            starttime (int, optional): Select jobs eligible after this
+                timestamp
+            endtime (int, optional): Select jobs eligible before this
+                timestamp
+            userids (list): List of userids
+            flags (int): Flags
+            db_flags (int): DB Flags
+            clusters (list): List of clusters
+
+        Returns:
+            (dict): Dictionary whose key is the JOBS ID
+        """
+        cdef:
+            int i = 0
+            int listNum = 0
+            int apiError = 0
+            dict J_dict = {}
+            slurm.list_t *JOBSList
+            slurm.list_itr_t *iters = NULL
+
+
+        if clusters:
+            self.job_cond.cluster_list = slurm.slurm_list_create(NULL)
+            for _cluster in clusters:
+                _cluster = _cluster.encode("UTF-8")
+                slurm.slurm_addto_char_list_with_case(self.job_cond.cluster_list, _cluster, False)
+
+        if db_flags:
+            if isinstance(db_flags, int):
+                self.job_cond.db_flags = db_flags
+        else:
+            self.job_cond.db_flags = slurm.SLURMDB_JOB_FLAG_NOTSET
+
+        if flags:
+            if isinstance(flags, int):
+                self.job_cond.flags = flags
+
+        if jobids:
+            self.job_cond.step_list = slurm.slurm_list_create(NULL)
+            for _jobid in jobids:
+                if isinstance(_jobid, int):
+                    _jobid = str(_jobid).encode("UTF-8")
+                else:
+                    _jobid = _jobid.encode("UTF-8")
+                slurm.slurm_addto_step_list(self.job_cond.step_list, _jobid)
+
+        if userids:
+            self.job_cond.userid_list = slurm.slurm_list_create(NULL)
+            for _userid in userids:
+                if isinstance(_userid, int):
+                    _userid = str(_userid).encode("UTF-8")
+                else:
+                    _userid = _userid.encode("UTF-8")
+                slurm.slurm_addto_char_list_with_case(self.job_cond.userid_list, _userid, False)
+
+        if starttime:
+            self.job_cond.usage_start = slurm.slurm_parse_time(starttime, 1)
+            errno = slurm_get_errno()
+            if errno == slurm.ESLURM_INVALID_TIME_VALUE:
+                raise ValueError(slurm.slurm_strerror(errno), errno)
+
+        if endtime:
+            self.job_cond.usage_end = slurm.slurm_parse_time(endtime, 1)
+            errno = slurm_get_errno()
+            if errno == slurm.ESLURM_INVALID_TIME_VALUE:
+                raise ValueError(slurm.slurm_strerror(errno), errno)
+
+        JOBSList = slurm.slurmdb_jobs_get(self.db_conn, self.job_cond)
+
+        if JOBSList is NULL:
+            apiError = slurm_get_errno()
+            raise ValueError(slurm.slurm_strerror(apiError), apiError)
+
+        listNum = slurm.slurm_list_count(JOBSList)
+        iters = slurm.slurm_list_iterator_create(JOBSList)
+
+        for i in range(listNum):
+            job = <slurm.slurmdb_job_rec_t *>slurm.slurm_list_next(iters)
+
+            JOBS_info = {}
+            if job is not NULL:
+                jobid = job.jobid
+                JOBS_info['account'] = stringOrNone(job.account, '')
+                JOBS_info['alloc_nodes'] = job.alloc_nodes
+                JOBS_info['array_job_id'] = job.array_job_id
+                JOBS_info['array_max_tasks'] = job.array_max_tasks
+                JOBS_info['array_task_id'] = job.array_task_id
+                JOBS_info['array_task_str'] = stringOrNone(job.array_task_str, '')
+                JOBS_info['associd'] = job.associd
+                JOBS_info['blockid'] = stringOrNone(job.blockid, '')
+                JOBS_info['cluster'] = stringOrNone(job.cluster, '')
+                JOBS_info['constraints'] = stringOrNone(job.constraints, '')
+                JOBS_info['container'] = stringOrNone(job.container, '')
+                JOBS_info['derived_ec'] = job.derived_ec
+                JOBS_info['derived_es'] = stringOrNone(job.derived_es, '')
+                JOBS_info['elapsed'] = job.elapsed
+                JOBS_info['eligible'] = job.eligible
+                JOBS_info['end'] = job.end
+                JOBS_info['env'] = stringOrNone(job.env, '')
+                JOBS_info['exitcode'] = job.exitcode
+                JOBS_info['gid'] = job.gid
+                JOBS_info['jobid'] = job.jobid
+                JOBS_info['jobname'] = stringOrNone(job.jobname, '')
+                JOBS_info['partition'] = stringOrNone(job.partition, '')
+                JOBS_info['nodes'] = stringOrNone(job.nodes, '')
+                JOBS_info['priority'] = job.priority
+                JOBS_info['qosid'] = job.qosid
+                JOBS_info['req_cpus'] = job.req_cpus
+
+                if job.req_mem & slurm.MEM_PER_CPU:
+                    JOBS_info['req_mem'] = job.req_mem & (~slurm.MEM_PER_CPU)
+                    JOBS_info['req_mem_per_cpu'] = True
+                else:
+                    JOBS_info['req_mem'] = job.req_mem
+                    JOBS_info['req_mem_per_cpu'] = False
+
+                JOBS_info['requid'] = job.requid
+                JOBS_info['resvid'] = job.resvid
+                JOBS_info['resv_name'] = stringOrNone(job.resv_name,'')
+                JOBS_info['script'] = stringOrNone(job.script,'')
+                JOBS_info['show_full'] = job.show_full
+                JOBS_info['start'] = job.start
+                JOBS_info['state'] = job.state
+                JOBS_info['state_str'] = stringOrNone(slurm.slurm_job_state_string(job.state), '')
+
+                # TRES are reported as strings in the format `TRESID=value` where TRESID is one of:
+                # TRES_CPU=1, TRES_MEM=2, TRES_ENERGY=3, TRES_NODE=4, TRES_BILLING=5, TRES_FS_DISK=6, TRES_VMEM=7, TRES_PAGES=8
+                # Example: '1=0,2=745472,3=0,6=1949,7=7966720,8=0'
+
+                # add job steps
+                JOBS_info['steps'] = {}
+                step_dict = JOBS_info['steps']
+
+                stepsNum = slurm.slurm_list_count(job.steps)
+                stepsIter = slurm.slurm_list_iterator_create(job.steps)
+                for i in range(stepsNum):
+                    step = <slurm.slurmdb_step_rec_t *>slurm.slurm_list_next(stepsIter)
+                    step_info = {}
+                    if step is not NULL:
+                        step_id = step.step_id.step_id
+
+                        step_info['container'] = stringOrNone(step.container, '')
+                        step_info['elapsed'] = step.elapsed
+                        step_info['end'] = step.end
+                        step_info['exitcode'] = step.exitcode
+
+                        # Don't add this unless you want to create an endless recursive structure
+                        # step_info['job_ptr'] = JOBS_Info # job's record
+
+                        step_info['nnodes'] = step.nnodes
+                        step_info['nodes'] = stringOrNone(step.nodes, '')
+                        step_info['ntasks'] = step.ntasks
+                        step_info['pid_str'] = stringOrNone(step.pid_str, '')
+                        step_info['req_cpufreq_min'] = step.req_cpufreq_min
+                        step_info['req_cpufreq_max'] = step.req_cpufreq_max
+                        step_info['req_cpufreq_gov'] = step.req_cpufreq_gov
+                        step_info['requid'] = step.requid
+                        step_info['start'] = step.start
+                        step_info['state'] = step.state
+                        step_info['state_str'] = stringOrNone(slurm.slurm_job_state_string(step.state), '')
+
+                        # TRES are reported as strings in the format `TRESID=value` where TRESID is one of:
+                        # TRES_CPU=1, TRES_MEM=2, TRES_ENERGY=3, TRES_NODE=4, TRES_BILLING=5, TRES_FS_DISK=6, TRES_VMEM=7, TRES_PAGES=8
+                        # Example: '1=0,2=745472,3=0,6=1949,7=7966720,8=0'
+                        step_info['stats'] = {}
+                        stats = step_info['stats']
+                        stats['act_cpufreq'] = step.stats.act_cpufreq
+                        stats['consumed_energy'] = step.stats.consumed_energy
+                        stats['tres_usage_in_max'] = stringOrNone(step.stats.tres_usage_in_max, '')
+                        stats['tres_usage_in_max_nodeid'] = stringOrNone(step.stats.tres_usage_in_max_nodeid, '')
+                        stats['tres_usage_in_max_taskid'] = stringOrNone(step.stats.tres_usage_in_max_taskid, '')
+                        stats['tres_usage_in_min'] = stringOrNone(step.stats.tres_usage_in_min, '')
+                        stats['tres_usage_in_min_nodeid'] = stringOrNone(step.stats.tres_usage_in_min_nodeid, '')
+                        stats['tres_usage_in_min_taskid'] = stringOrNone(step.stats.tres_usage_in_min_taskid, '')
+                        stats['tres_usage_in_tot'] = stringOrNone(step.stats.tres_usage_in_tot, '')
+                        stats['tres_usage_out_ave'] = stringOrNone(step.stats.tres_usage_out_ave, '')
+                        stats['tres_usage_out_max'] = stringOrNone(step.stats.tres_usage_out_max, '')
+                        stats['tres_usage_out_max_nodeid'] = stringOrNone(step.stats.tres_usage_out_max_nodeid, '')
+                        stats['tres_usage_out_max_taskid'] = stringOrNone(step.stats.tres_usage_out_max_taskid, '')
+                        stats['tres_usage_out_min'] = stringOrNone(step.stats.tres_usage_out_min, '')
+                        stats['tres_usage_out_min_nodeid'] = stringOrNone(step.stats.tres_usage_out_min_nodeid, '')
+                        stats['tres_usage_out_min_taskid'] = stringOrNone(step.stats.tres_usage_out_min_taskid, '')
+                        stats['tres_usage_out_tot'] = stringOrNone(step.stats.tres_usage_out_tot, '')
+                        step_info['stepid'] = step_id
+                        step_info['stepname'] = stringOrNone(step.stepname, '')
+                        step_info['submit_line'] = stringOrNone(step.submit_line, '')
+                        step_info['suspended'] = step.suspended
+                        step_info['sys_cpu_sec'] = step.sys_cpu_sec
+                        step_info['sys_cpu_usec'] = step.sys_cpu_usec
+                        step_info['task_dist'] = step.task_dist
+                        step_info['tot_cpu_sec'] = step.tot_cpu_sec
+                        step_info['tot_cpu_usec'] = step.tot_cpu_usec
+                        step_info['user_cpu_sec'] = step.user_cpu_sec
+                        step_info['user_cpu_usec'] = step.user_cpu_usec
+
+                        step_dict[step_id] = step_info
+
+                slurm.slurm_list_iterator_destroy(stepsIter)
+
+                JOBS_info['submit'] = job.submit
+                JOBS_info['submit_line'] = stringOrNone(job.submit_line,'')
+                JOBS_info['suspended'] = job.suspended
+                JOBS_info['sys_cpu_sec'] = job.sys_cpu_sec
+                JOBS_info['sys_cpu_usec'] = job.sys_cpu_usec
+                JOBS_info['timelimit'] = job.timelimit
+                JOBS_info['tot_cpu_sec'] = job.tot_cpu_sec
+                JOBS_info['tot_cpu_usec'] = job.tot_cpu_usec
+                JOBS_info['tres_alloc_str'] = stringOrNone(job.tres_alloc_str,'')
+                JOBS_info['tres_req_str'] = stringOrNone(job.tres_req_str,'')
+                JOBS_info['uid'] = job.uid
+                JOBS_info['used_gres'] = stringOrNone(job.used_gres, '')
+                JOBS_info['user'] = stringOrNone(job.user,'')
+                JOBS_info['user_cpu_sec'] = job.user_cpu_sec
+                JOBS_info['user_cpu_usec'] = job.user_cpu_usec
+                JOBS_info['wckey'] = stringOrNone(job.wckey, '')
+                JOBS_info['wckeyid'] = job.wckeyid
+                JOBS_info['work_dir'] = stringOrNone(job.work_dir, '')
+                J_dict[jobid] = JOBS_info
+
+        slurm.slurm_list_iterator_destroy(iters)
+        slurm.slurm_list_destroy(JOBSList)
+        if clusters:
+            slurm.slurm_list_destroy(self.job_cond.cluster_list)
+        if userids:
+            slurm.slurm_list_destroy(self.job_cond.userid_list)
+        return J_dict
+
+#
+# slurmdbd Reservations Class
+#
+cdef class slurmdb_reservations:
+    """Access Slurmdbd reservations information."""
+    cdef:
+        void *dbconn
+        slurm.slurmdb_reservation_cond_t *reservation_cond
+
+    def __cinit__(self):
+        self.reservation_cond = <slurm.slurmdb_reservation_cond_t *>xmalloc(sizeof(slurm.slurmdb_reservation_cond_t))
+
+    def __dealloc__(self):
+        slurm.slurmdb_destroy_reservation_cond(self.reservation_cond)
+
+    def set_reservation_condition(self, start_time, end_time):
+        """Limit the next get() call to reservations that start after and
+        before a certain time.
+
+        Args:
+            start_time (int): Select reservations that start after this
+                unix timestamp
+            end_time (int): Select reservations that end before this unix
+                timestamp
+        """
+        if self.reservation_cond == NULL:
+            self.reservation_cond = <slurm.slurmdb_reservation_cond_t *>xmalloc(sizeof(slurm.slurmdb_reservation_cond_t))
+
+        if self.reservation_cond != NULL:
+            self.reservation_cond.with_usage = 1
+            self.reservation_cond.time_start = <slurm.time_t>start_time
+            self.reservation_cond.time_end = <slurm.time_t>end_time
+        else:
+            raise MemoryError()
+
+    def get(self):
+        """Get slurm reservations information.
+
+        Returns:
+            (dict): Dictionary whose keys are the reservations ids
+        """
+        cdef:
+            slurm.list_t *reservation_list
+            slurm.list_itr_t *iters = NULL
+            slurm.slurmdb_reservation_rec_t *reservation
+            int i = 0
+            int j = 0
+            int listNum
+            slurm.list_t *_resvList
+
+        Reservation_dict = {}
+        reservation_list = slurm.slurmdb_reservations_get(self.dbconn, self.reservation_cond)
+
+        if reservation_list is not NULL:
+            listNum = slurm.slurm_list_count(reservation_list)
+            iters = slurm.slurm_list_iterator_create(reservation_list)
+
+            for i in range(listNum):
+                reservation = <slurm.slurmdb_reservation_rec_t *>slurm.slurm_list_next(iters)
+                Reservation_rec_dict = {}
+
+                if reservation is not NULL:
+                    reservation_id = reservation.id
+                    Reservation_rec_dict['name'] = stringOrNone(reservation.name, '')
+                    Reservation_rec_dict['nodes'] = stringOrNone(reservation.nodes, '')
+                    Reservation_rec_dict['node_index'] = stringOrNone(reservation.node_inx, '')
+                    Reservation_rec_dict['associations'] = stringOrNone(reservation.assocs, '')
+                    Reservation_rec_dict['cluster'] = stringOrNone(reservation.cluster, '')
+                    Reservation_rec_dict['tres_str'] = stringOrNone(reservation.tres_str, '')
+                    Reservation_rec_dict['reservation_id'] = reservation.id
+                    Reservation_rec_dict['time_start'] = reservation.time_start
+                    Reservation_rec_dict['time_start_prev'] = reservation.time_start_prev
+                    Reservation_rec_dict['time_end'] = reservation.time_end
+                    Reservation_rec_dict['flags'] = reservation.flags
+
+                    if reservation.tres_list != NULL:
+                        num_tres = slurm.slurm_list_count(reservation.tres_list)
+                        tres_iters = slurm.slurm_list_iterator_create(reservation.tres_list)
+                        tres_dict = {}
+                        Reservation_rec_dict['num_tres'] = num_tres
+
+                        for j in range(num_tres):
+                            tres = <slurm.slurmdb_tres_rec_t *>slurm.slurm_list_next(tres_iters)
+                            if tres is not NULL:
+                                tmp_tres_dict = {}
+                                tres_id = tres.id
+                                tmp_tres_dict['name'] = stringOrNone(tres.name,'')
+                                tmp_tres_dict['type'] = stringOrNone(tres.type,'')
+                                tmp_tres_dict['rec_count'] = tres.rec_count
+                                tmp_tres_dict['count'] = tres.count
+                                tmp_tres_dict['tres_id'] = tres.id
+                                tmp_tres_dict['alloc_secs'] = tres.alloc_secs
+                                tres_dict[tres_id] = tmp_tres_dict
+
+                        Reservation_rec_dict['tres_list'] = tres_dict
+                        slurm.slurm_list_iterator_destroy(tres_iters)
+
+                    Reservation_dict[reservation_id] = Reservation_rec_dict
+
+            slurm.slurm_list_iterator_destroy(iters)
+            slurm.slurm_list_destroy(reservation_list)
+
+        return Reservation_dict
+
+#
+# slurmdbd clusters Class
+#
+cdef class slurmdb_clusters:
+    """Access Slurmdbd Clusters information."""
+    cdef:
+        void *db_conn
+        slurm.slurmdb_cluster_cond_t *cluster_cond
+
+    def __cinit__(self):
+        self.cluster_cond = <slurm.slurmdb_cluster_cond_t *>xmalloc(sizeof(slurm.slurmdb_cluster_cond_t))
+        slurm.slurmdb_init_cluster_cond(self.cluster_cond, 0)
+        self.db_conn = slurm.slurmdb_connection_get(NULL)
+
+    def __dealloc__(self):
+        slurm.slurmdb_destroy_cluster_cond(self.cluster_cond)
+        slurm.slurmdb_connection_close(&self.db_conn)
+
+    def set_cluster_condition(self, start_time, end_time):
+        """Limit the next get() call to clusters that existed after and before
+        a certain time.
+
+        Args:
+            start_time (int): Select clusters that existed after this unix
+                timestamp
+            end_time (int): Select clusters that existed before this unix
+                timestamp
+        """
+        if self.cluster_cond == NULL:
+            self.cluster_cond = <slurm.slurmdb_cluster_cond_t *>xmalloc(sizeof(slurm.slurmdb_cluster_cond_t))
+
+        if self.cluster_cond != NULL:
+            slurm.slurmdb_init_cluster_cond(self.cluster_cond, 0)
+            self.cluster_cond.with_deleted = 1
+            self.cluster_cond.with_usage = 1
+            self.cluster_cond.usage_start = <slurm.time_t>start_time
+            self.cluster_cond.usage_end = <slurm.time_t>end_time
+        else:
+            raise MemoryError()
+
+    def get(self):
+        """Get slurm clusters information.
+
+        Returns:
+            (dict): Dictionary whose keys are the clusters ids
+        """
+        cdef:
+            slurm.list_t *clusters_list
+            slurm.list_itr_t *iters = NULL
+            slurm.slurmdb_cluster_rec_t *cluster = NULL
+            int rc = slurm.SLURM_SUCCESS
+            int i = 0
+            int j = 0
+            int listNum
+
+        Cluster_dict = {}
+        cluster_list = slurm.slurmdb_clusters_get(self.db_conn, self.cluster_cond)
+
+        if cluster_list is not NULL:
+            listNum = slurm.slurm_list_count(cluster_list)
+            iters = slurm.slurm_list_iterator_create(cluster_list)
+
+            for i in range(listNum):
+                cluster = <slurm.slurmdb_cluster_rec_t *>slurm.slurm_list_next(iters)
+                Cluster_rec_dict = {}
+
+                if cluster is not NULL:
+                    cluster_name = stringOrNone(cluster.name, '')
+                    Cluster_rec_dict['name'] = cluster_name
+                    Cluster_rec_dict['nodes'] = stringOrNone(cluster.nodes, '')
+                    Cluster_rec_dict['control_host'] = stringOrNone(cluster.control_host, '')
+                    Cluster_rec_dict['tres'] = stringOrNone(cluster.tres_str, '')
+                    Cluster_rec_dict['control_port'] = cluster.control_port
+                    Cluster_rec_dict['rpc_version'] = cluster.rpc_version
+                    Cluster_rec_dict['flags'] = cluster.flags
+                    Cluster_rec_dict['dimensions'] = cluster.dimensions
+                    Cluster_rec_dict['classification'] = cluster.classification
+
+                    if cluster.accounting_list != NULL:
+                        num_acct = slurm.slurm_list_count(cluster.accounting_list)
+                        acct_iters = slurm.slurm_list_iterator_create(cluster.accounting_list)
+                        acct_dict = {}
+                        Cluster_rec_dict['num_acct'] = num_acct
+
+                        for j in range(num_acct):
+                            acct_tres = <slurm.slurmdb_cluster_accounting_rec_t *>slurm.slurm_list_next(acct_iters)
+                            if acct_tres is not NULL:
+                                acct_tres_dict = {}
+                                acct_tres_rec = <slurm.slurmdb_tres_rec_t>acct_tres.tres_rec
+                                acct_tres_id = acct_tres_rec.id
+
+                                if (acct_tres_rec.name is not NULL):
+                                    acct_tres_dict['name'] = stringOrNone(acct_tres_rec.name,'')
+                                if (acct_tres_rec.type is not NULL):
+                                    acct_tres_dict['type'] = stringOrNone(acct_tres_rec.type,'')
+
+                                acct_tres_dict['rec_count'] = acct_tres_rec.rec_count
+                                acct_tres_dict['count'] = acct_tres_rec.count
+                                acct_tres_dict['alloc_secs'] = acct_tres.alloc_secs
+                                acct_tres_dict['down_secs'] = acct_tres.down_secs
+                                acct_tres_dict['idle_secs'] = acct_tres.idle_secs
+                                acct_tres_dict['plan_secs'] = acct_tres.plan_secs
+                                acct_tres_dict['pdown_secs'] = acct_tres.pdown_secs
+                                acct_tres_dict['over_secs'] = acct_tres.over_secs
+                                acct_tres_dict['period_start'] = acct_tres.period_start
+                                acct_dict[acct_tres_id] = acct_tres_dict
+
+                        Cluster_rec_dict['accounting'] = acct_dict
+                        slurm.slurm_list_iterator_destroy(acct_iters)
+
+                    Cluster_dict[cluster_name] = Cluster_rec_dict
+
+            slurm.slurm_list_iterator_destroy(iters)
+            slurm.slurm_list_destroy(cluster_list)
+
+        return Cluster_dict
+
+#
+# slurmdbd Events Class
+#
+cdef class slurmdb_events:
+    """Access Slurmdbd events information."""
+    cdef:
+        void *dbconn
+        slurm.slurmdb_event_cond_t *event_cond
+
+    def __cinit__(self):
+        self.event_cond = <slurm.slurmdb_event_cond_t *>xmalloc(sizeof(slurm.slurmdb_event_cond_t))
+
+    def __dealloc__(self):
+        slurm.slurmdb_destroy_event_cond(self.event_cond)
+
+    def set_event_condition(self, start_time, end_time):
+        """Limit the next get() call to conditions that existed after and
+        before a certain time.
+
+        Args:
+            start_time (int): Select conditions that existed after this unix timestamp
+            end_time (int): Select conditions that existed before this unix timestamp
+        """
+        if self.event_cond == NULL:
+            self.event_cond = <slurm.slurmdb_event_cond_t *>xmalloc(sizeof(slurm.slurmdb_event_cond_t))
+
+        if self.event_cond != NULL:
+            ##self.event_cond.with_usage = 1
+            self.event_cond.period_start = <slurm.time_t>start_time
+            self.event_cond.period_end = <slurm.time_t>end_time
+        else:
+            raise MemoryError()
+
+    def get(self):
+        """Get slurm events information.
+
+        Returns:
+            (dict): Dictionary whose keys are the events ids
+        """
+        cdef:
+            slurm.list_t *event_list
+            slurm.list_itr_t *iters = NULL
+            slurm.slurmdb_event_rec_t *event = NULL
+            int i = 0
+            int listNum = 0
+
+        Event_dict = {}
+        event_list = slurm.slurmdb_events_get(self.dbconn, self.event_cond)
+
+        if event_list is not NULL:
+            listNum = slurm.slurm_list_count(event_list)
+            iters = slurm.slurm_list_iterator_create(event_list)
+
+            for i in range(listNum):
+                event = <slurm.slurmdb_event_rec_t *>slurm.slurm_list_next(iters)
+                event_rec_dict = {}
+
+                if event is not NULL:
+                    event_id = event.period_start
+                    event_rec_dict['cluster'] = stringOrNone(event.cluster, '')
+                    event_rec_dict['cluster_nodes'] = stringOrNone(event.cluster_nodes, '')
+                    event_rec_dict['node_name'] = stringOrNone(event.node_name, '')
+                    event_rec_dict['reason'] = stringOrNone(event.reason, '')
+                    event_rec_dict['tres_str'] = stringOrNone(event.tres_str, '')
+                    event_rec_dict['event_type'] = event.event_type
+                    event_rec_dict['time_start'] = event.period_start
+                    event_rec_dict['time_end'] = event.period_end
+                    event_rec_dict['tres_str'] = event.tres_str
+                    event_rec_dict['state'] = event.state
+                    event_rec_dict['reason_uid'] = event.reason_uid
+
+                    Event_dict[event_id] = event_rec_dict
+
+            slurm.slurm_list_iterator_destroy(iters)
+            slurm.slurm_list_destroy(event_list)
+
+        return Event_dict
+
+#
+# SlurmDB Reports (sreport)
+#
+
+cdef class slurmdb_reports:
+    """Access Slurmdbd reports."""
+    cdef:
+        void *db_conn
+        slurm.slurmdb_assoc_cond_t *assoc_cond
+
+    def __cinit__(self):
+        self.assoc_cond = <slurm.slurmdb_assoc_cond_t *>xmalloc(sizeof(slurm.slurmdb_assoc_cond_t))
+
+    def __dealloc__(self):
+        slurm.slurmdb_destroy_assoc_cond(self.assoc_cond)
+
+    def report_cluster_account_by_user(self, starttime=None,
+                                       endtime=None):
+        """sreport cluster AccountUtilizationByUser
+
+        Args:
+            starttime (Union[str, int]): Start time
+            endtime (Union[str, int]): Start time
+
+        Returns:
+            (dict): sreport information.
+        """
+        cdef:
+            slurm.list_t *slurmdb_report_cluster_list = NULL
+            slurm.list_itr_t *itr = NULL
+            slurm.list_itr_t *cluster_itr = NULL
+            slurm.list_itr_t *tres_itr = NULL
+            slurm.slurmdb_cluster_cond_t cluster_cond
+            slurm.slurmdb_report_assoc_rec_t *slurmdb_report_assoc = NULL
+            slurm.slurmdb_report_cluster_rec_t *slurmdb_report_cluster = NULL
+            slurm.slurmdb_tres_rec_t *tres
+            time_t start_time
+            time_t end_time
+            int i
+            int j
+
+        slurm.slurmdb_init_cluster_cond(&cluster_cond, 0)
+        self.assoc_cond.flags = slurm.ASSOC_COND_FLAG_SUB_ACCTS
+
+        if starttime:
+            self.assoc_cond.usage_start = slurm.slurm_parse_time(starttime, 1)
+
+        if endtime:
+            self.assoc_cond.usage_end = slurm.slurm_parse_time(endtime, 1)
+
+        start_time = self.assoc_cond.usage_start
+        end_time = self.assoc_cond.usage_end
+        slurm.slurmdb_report_set_start_end_time(&start_time, &end_time)
+        self.assoc_cond.usage_start = start_time
+        self.assoc_cond.usage_end = end_time
+
+        self.assoc_cond.flags |= slurm.ASSOC_COND_FLAG_WITH_USAGE
+        self.assoc_cond.flags |= slurm.ASSOC_COND_FLAG_WITH_DELETED
+
+        slurmdb_report_cluster_list = slurm.slurmdb_report_cluster_account_by_user(
+            self.db_conn, self.assoc_cond
+        )
+
+        if slurmdb_report_cluster_list is NULL:
+            slurm.slurmdb_destroy_assoc_cond(self.assoc_cond)
+            slurm.slurm_list_destroy(slurmdb_report_cluster_list)
+            slurmdb_report_cluster_list = NULL
+            sys.exit(0)
+
+        cluster_itr = slurm.slurm_list_iterator_create(slurmdb_report_cluster_list)
+        Cluster_dict = {}
+
+        for i in range(slurm.slurm_list_count(slurmdb_report_cluster_list)):
+            slurmdb_report_cluster = <slurm.slurmdb_report_cluster_rec_t *>slurm.slurm_list_next(cluster_itr)
+            cluster_name = stringOrNone(slurmdb_report_cluster.name, '')
+            Cluster_dict[cluster_name] = {}
+            itr = slurm.slurm_list_iterator_create(slurmdb_report_cluster.assoc_list)
+
+            for j in range(slurm.slurm_list_count(slurmdb_report_cluster.assoc_list)):
+                slurmdb_report_assoc = <slurm.slurmdb_report_assoc_rec_t *>slurm.slurm_list_next(itr)
+                Assoc_dict = {}
+                Assoc_dict["account"] = stringOrNone(slurmdb_report_assoc.acct, '')
+                Assoc_dict["cluster"] = stringOrNone(slurmdb_report_assoc.cluster, '')
+                Assoc_dict["parent_account"] = stringOrNone(slurmdb_report_assoc.parent_acct, '')
+                Assoc_dict["user"] = stringOrNone(slurmdb_report_assoc.user, '')
+                Assoc_dict["tres_list"] = []
+                tres_itr = slurm.slurm_list_iterator_create(slurmdb_report_assoc.tres_list)
+
+                for k in range(slurm.slurm_list_count(slurmdb_report_assoc.tres_list)):
+                    tres = <slurm.slurmdb_tres_rec_t *>slurm.slurm_list_next(tres_itr)
+                    Tres_dict = {}
+                    Tres_dict["alloc_secs"] = <int>tres.alloc_secs
+                    Tres_dict["rec_count"] = tres.rec_count
+                    Tres_dict["count"] = <int>tres.count
+                    Tres_dict["id"] = tres.id
+                    Tres_dict["name"] = stringOrNone(tres.name, '')
+                    Tres_dict["type"] = stringOrNone(tres.type, '')
+                    Assoc_dict["tres_list"].append(Tres_dict)
+
+                Cluster_dict[cluster_name] = Assoc_dict
+                slurm.slurm_list_iterator_destroy(tres_itr)
+
+            slurm.slurm_list_iterator_destroy(itr)
+
+        slurm.slurm_list_iterator_destroy(cluster_itr)
+        slurm.slurm_list_destroy(slurmdb_report_cluster_list)
+        slurmdb_report_cluster_list = NULL
+
+        return Cluster_dict
+
+#
+# Helper functions to convert numerical States
+#
+
+
+def get_last_slurm_error():
+    """Get and return the last error from a slurm API call.
+
+    Returns:
+        (int): Slurm error number and the associated error string
+    """
+    rc = slurm_get_errno()
+
+    if rc == 0:
+        return (rc, 'Success')
+    else:
+        return (rc, stringOrNone(slurm.slurm_strerror(rc), ''))
+
+cdef inline dict __get_licenses(char *licenses):
+    """Returns a dict of licenses from the slurm license string.
+
+    Args:
+        licenses (str): String containing license information
+
+    Returns:
+        dict: Dictionary of licenses and associated value.
+    """
+    if (licenses is NULL):
+        return {}
+
+    cdef:
+        dict licDict = {}
+        int i = 0
+        list alist = listOrNone(licenses, ',')
+        int listLen = len(alist)
+
+    if alist:
+        for i in range(listLen):
+            value = 1
+            try:
+                key, value = alist[i].split(':')
+            except:
+                key = alist[i]
+            licDict["%s" % key] = value
+
+    return licDict
+
+
+def get_node_use(inx):
+    """Returns a string that represents the block node mode.
+
+    Args:
+        ResType: Slurm block node usage
+
+    Returns:
+        use (str): Block node usage string
+    """
+    return slurm.slurm_node_state_string(inx)
+
+
+def get_trigger_res_type(uint16_t inx):
+    """Returns a string that represents the slurm trigger res type.
+
+    Args:
+        ResType (int): Slurm trigger res state
+            * TRIGGER_RES_TYPE_JOB        1
+            * TRIGGER_RES_TYPE_NODE       2
+            * TRIGGER_RES_TYPE_SLURMCTLD  3
+            * TRIGGER_RES_TYPE_SLURMDBD   4
+            * TRIGGER_RES_TYPE_DATABASE   5
+            * TRIGGER_RES_TYPE_OTHER      7
+
+    Returns:
+        (str): Trigger reservation state string
+    """
+    return __get_trigger_res_type(inx)
+
+cdef inline object __get_trigger_res_type(uint16_t ResType):
+    rtype = 'unknown'
+
+    if ResType == TRIGGER_RES_TYPE_JOB:
+        rtype = 'job'
+    elif ResType == TRIGGER_RES_TYPE_NODE:
+        rtype = 'node'
+    elif ResType == TRIGGER_RES_TYPE_SLURMCTLD:
+        rtype = 'slurmctld'
+    elif ResType == TRIGGER_RES_TYPE_SLURMDBD:
+        rtype = 'slurmbdb'
+    elif ResType == TRIGGER_RES_TYPE_DATABASE:
+        rtype = 'database'
+    elif ResType == TRIGGER_RES_TYPE_OTHER:
+        rtype = 'other'
+
+    return "%s" % rtype
+
+
+def get_trigger_type(uint32_t inx):
+    """Returns a string that represents the state of the slurm trigger.
+
+    Args:
+        TriggerType (int): Slurm trigger type
+            * TRIGGER_TYPE_UP                 0x00000001
+            * TRIGGER_TYPE_DOWN               0x00000002
+            * TRIGGER_TYPE_FAIL               0x00000004
+            * TRIGGER_TYPE_TIME               0x00000008
+            * TRIGGER_TYPE_FINI               0x00000010
+            * TRIGGER_TYPE_RECONFIG           0x00000020
+            * TRIGGER_TYPE_IDLE               0x00000080
+            * TRIGGER_TYPE_DRAINED            0x00000100
+            * TRIGGER_TYPE_PRI_CTLD_FAIL      0x00000200
+            * TRIGGER_TYPE_PRI_CTLD_RES_OP    0x00000400
+            * TRIGGER_TYPE_PRI_CTLD_RES_CTRL  0x00000800
+            * TRIGGER_TYPE_PRI_CTLD_ACCT_FULL 0x00001000
+            * TRIGGER_TYPE_BU_CTLD_FAIL       0x00002000
+            * TRIGGER_TYPE_BU_CTLD_RES_OP     0x00004000
+            * TRIGGER_TYPE_BU_CTLD_AS_CTRL    0x00008000
+            * TRIGGER_TYPE_PRI_DBD_FAIL       0x00010000
+            * TRIGGER_TYPE_PRI_DBD_RES_OP     0x00020000
+            * TRIGGER_TYPE_PRI_DB_FAIL        0x00040000
+            * TRIGGER_TYPE_PRI_DB_RES_OP      0x00080000
+            * TRIGGER_TYPE_BURST_BUFFER       0x00100000
+
+    Returns:
+        (str): Trigger state string
+    """
+    return __get_trigger_type(inx)
+
+cdef inline object __get_trigger_type(uint32_t TriggerType):
+    rtype = 'unknown'
+
+    if TriggerType == TRIGGER_TYPE_UP:
+        rtype = 'up'
+    elif TriggerType == TRIGGER_TYPE_DOWN:
+        rtype = 'down'
+    elif TriggerType == TRIGGER_TYPE_FAIL:
+        rtype = 'fail'
+    elif TriggerType == TRIGGER_TYPE_TIME:
+        rtype = 'time'
+    elif TriggerType == TRIGGER_TYPE_FINI:
+        rtype = 'fini'
+    elif TriggerType == TRIGGER_TYPE_RECONFIG:
+        rtype = 'reconfig'
+    elif TriggerType == TRIGGER_TYPE_IDLE:
+        rtype = 'idle'
+    elif TriggerType == TRIGGER_TYPE_DRAINED:
+        rtype = 'drained'
+    elif TriggerType == TRIGGER_TYPE_PRI_CTLD_FAIL:
+        rtype = 'primary_slurmctld_failure'
+    elif TriggerType == TRIGGER_TYPE_PRI_CTLD_RES_OP:
+        rtype = 'primary_slurmctld_resumed_operation'
+    elif TriggerType == TRIGGER_TYPE_PRI_CTLD_RES_CTRL:
+        rtype = 'primary_slurmctld_resumed_control'
+    elif TriggerType == TRIGGER_TYPE_PRI_CTLD_ACCT_FULL:
+        rtype = 'primary_slurmctld_acct_buffer_full'
+    elif TriggerType == TRIGGER_TYPE_BU_CTLD_FAIL:
+        rtype = 'backup_ctld_failure'
+    elif TriggerType == TRIGGER_TYPE_BU_CTLD_RES_OP:
+        rtype = 'backup_ctld_resumed_operation'
+    elif TriggerType == TRIGGER_TYPE_BU_CTLD_AS_CTRL:
+        rtype = 'backup_ctld_assumed_control'
+    elif TriggerType == TRIGGER_TYPE_PRI_DBD_FAIL:
+        rtype = 'primary_slurmdbd_failure'
+    elif TriggerType == TRIGGER_TYPE_PRI_DBD_RES_OP:
+        rtype = 'primary_slurmdbd_resumed_operation'
+    elif TriggerType == TRIGGER_TYPE_PRI_DB_FAIL:
+        return 'primary_database_failure'
+    elif TriggerType == TRIGGER_TYPE_PRI_DB_RES_OP:
+        rtype = 'primary_database_resumed_operation'
+    elif TriggerType == TRIGGER_TYPE_BURST_BUFFER:
+        rtype = 'burst_buffer'
+
+    return "%s" % rtype
+
+
+#def get_res_state(uint16_t inx):
+#    """Returns a string that represents the state of the slurm reservation.
+#
+#    :param int flags: Slurm reservation flags
+#        - RESERVE_FLAG_MAINT            0x00000001
+#        - RESERVE_FLAG_NO_MAINT         0x00000002
+#        - RESERVE_FLAG_DAILY            0x00000004
+#        - RESERVE_FLAG_NO_DAILY         0x00000008
+#        - RESERVE_FLAG_WEEKLY           0x00000010
+#        - RESERVE_FLAG_NO_WEEKLY        0x00000020
+#        - RESERVE_FLAG_IGN_JOBS         0x00000040
+#        - RESERVE_FLAG_NO_IGN_JOB       0x00000080
+#        - RESERVE_FLAG_ANY_NODES        0x00000100
+#        - RESERVE_FLAG_NO_ANY_NODES     0x00000200
+#        - RESERVE_FLAG_STATIC           0x00000400
+#        - RESERVE_FLAG_NO_STATIC        0x00000800
+#        - RESERVE_FLAG_PART_NODES       0x00001000
+#        - RESERVE_FLAG_NO_PART_NODES    0x00002000
+#        - RESERVE_FLAG_OVERLAP          0x00004000
+#        - RESERVE_FLAG_SPEC_NODES       0x00008000
+#        - RESERVE_FLAG_TIME_FLOAT       0x00020000
+#        - RESERVE_FLAG_REPLACE          0x00040000
+#    :returns: Reservation state string
+#    :rtype: string
+#    """
+#    try:
+#        return slurm.slurm_reservation_flags_string(inx)
+#    except:
+#        pass
+
+
+def get_debug_flags(uint64_t inx):
+    """Returns a string that represents the slurm debug flags.
+
+    Args:
+        flags (int): Slurm debug flags
+
+    Returns:
+        (str): Debug flag string
+    """
+    return debug_flags2str(inx)
+
+cdef inline list debug_flags2str(uint64_t debug_flags):
+    cdef list debugFlags = []
+
+    if (debug_flags & DEBUG_FLAG_ACCRUE):
+        debugFlags.append('Accrue')
+
+    if (debug_flags & DEBUG_FLAG_AGENT):
+        debugFlags.append('Agent')
+
+    if (debug_flags & DEBUG_FLAG_BACKFILL):
+        debugFlags.append('Backfill')
+
+    if (debug_flags & DEBUG_FLAG_BACKFILL_MAP):
+        debugFlags.append('BackfillMap')
+
+    if (debug_flags & DEBUG_FLAG_BURST_BUF):
+        debugFlags.append('BurstBuffer')
+
+    if (debug_flags & DEBUG_FLAG_CGROUP):
+        debugFlags.append('Cgroup')
+
+    if (debug_flags & DEBUG_FLAG_CPU_FREQ):
+        debugFlags.append('CpuFrequency')
+
+    if (debug_flags & DEBUG_FLAG_CPU_BIND):
+        debugFlags.append('CPU_Bind')
+
+    if (debug_flags & DEBUG_FLAG_DB_ARCHIVE):
+        debugFlags.append('DB_Archive')
+
+    if (debug_flags & DEBUG_FLAG_DB_ASSOC):
+        debugFlags.append('DB_Assoc')
+
+    if (debug_flags & DEBUG_FLAG_DB_TRES):
+        debugFlags.append('DB_TRES')
+
+    if (debug_flags & DEBUG_FLAG_DB_JOB):
+        debugFlags.append('DB_Job')
+
+    if (debug_flags & DEBUG_FLAG_DB_QOS):
+        debugFlags.append('DB_QOS')
+
+    if (debug_flags & DEBUG_FLAG_DB_QUERY):
+        debugFlags.append('DB_Query')
+
+    if (debug_flags & DEBUG_FLAG_DB_RESV):
+        debugFlags.append('DB_Reservation')
+
+    if (debug_flags & DEBUG_FLAG_DB_RES):
+        debugFlags.append('DB_Resource')
+
+    if (debug_flags & DEBUG_FLAG_DB_STEP):
+        debugFlags.append('DB_Step')
+
+    if (debug_flags & DEBUG_FLAG_DB_USAGE):
+        debugFlags.append('DB_Usage')
+
+    if (debug_flags & DEBUG_FLAG_DB_WCKEY):
+        debugFlags.append('DB_WCKey')
+
+    if (debug_flags & DEBUG_FLAG_ENERGY):
+        debugFlags.append('Energy')
+
+    if (debug_flags & DEBUG_FLAG_FEDR):
+        debugFlags.append('Federation')
+
+    if (debug_flags & DEBUG_FLAG_GANG):
+        debugFlags.append('Gang')
+
+    if (debug_flags & DEBUG_FLAG_GRES):
+        debugFlags.append('Gres')
+
+    if (debug_flags & DEBUG_FLAG_HETJOB):
+        debugFlags.append('HeteroJobs')
+
+    if (debug_flags & DEBUG_FLAG_INTERCONNECT):
+        debugFlags.append('Interconnect')
+
+    if (debug_flags & DEBUG_FLAG_JAG):
+        debugFlags.append('Jag')
+
+    if (debug_flags & DEBUG_FLAG_NODE_FEATURES):
+        debugFlags.append('NodeFeatures')
+
+    if (debug_flags & DEBUG_FLAG_LICENSE):
+        debugFlags.append('License')
+
+    if (debug_flags & DEBUG_FLAG_NO_CONF_HASH):
+        debugFlags.append('NO_CONF_HASH')
+
+    if (debug_flags & DEBUG_FLAG_POWER):
+        debugFlags.append('Power')
+
+    if (debug_flags & DEBUG_FLAG_PRIO):
+        debugFlags.append('Priority')
+
+    if (debug_flags & DEBUG_FLAG_PROTOCOL):
+        debugFlags.append('Protocol')
+
+    if (debug_flags & DEBUG_FLAG_RESERVATION):
+        debugFlags.append('Reservation')
+
+    if (debug_flags & DEBUG_FLAG_ROUTE):
+        debugFlags.append('Route')
+
+    if (debug_flags & DEBUG_FLAG_SELECT_TYPE):
+        debugFlags.append('SelectType')
+
+    if (debug_flags & DEBUG_FLAG_SCRIPT):
+        debugFlags.append('Script')
+
+    if (debug_flags & DEBUG_FLAG_STEPS):
+        debugFlags.append('Steps')
+
+    if (debug_flags & DEBUG_FLAG_SWITCH):
+        debugFlags.append('Switch')
+
+    if (debug_flags & DEBUG_FLAG_TRACE_JOBS):
+        debugFlags.append('TraceJobs')
+
+    if (debug_flags & DEBUG_FLAG_TRIGGERS):
+        debugFlags.append('Triggers')
+
+    return debugFlags
+
+
+def get_node_state(uint32_t inx):
+    """Returns a string that represents the state of the slurm node.
+
+    Args:
+        inx (int): Slurm node state
+
+    Returns:
+        state (str): Node state string
+    """
+    return slurm.slurm_node_state_string(inx)
+
+
+def get_rm_partition_state(int inx):
+    """Returns a string that represents the partition state.
+
+    Args:
+        inx (int): Slurm partition state
+
+    Returns:
+        (str): Partition state string
+    """
+    return __get_rm_partition_state(inx)
+
+
+cdef inline object __get_rm_partition_state(int inx):
+    cdef list state = [
+        'Free',
+        'Configuring',
+        'Ready',
+        'Busy',
+        'Deallocating',
+        'Error',
+        'Nav'
+    ]
+
+    rm_part_state = 'Unknown'
+    try:
+        rm_part_state = state[inx]
+    except:
+        pass
+
+    return "%s" % rm_part_state
+
+
+def get_preempt_mode(uint16_t inx):
+    """Returns a string that represents the preempt mode.
+
+    Args:
+        inx (int): Slurm preempt mode
+            * PREEMPT_MODE_OFF        0x0000
+            * PREEMPT_MODE_SUSPEND    0x0001
+            * PREEMPT_MODE_REQUEUE    0x0002
+            * PREEMPT_MODE_CANCEL     0x0008
+            * PREEMPT_MODE_GANG       0x8000
+
+    Returns:
+        mode (str): Preempt mode string
+    """
+    return slurm.slurm_preempt_mode_string(inx)
+
+
+def get_partition_state(uint16_t inx):
+    """Returns a string that represents the state of the slurm partition.
+
+    Args:
+        inx (int): Slurm partition state
+            * PARTITION_DOWN      0x01
+            * PARTITION_UP        0x01 | 0x02
+            * PARTITION_DRAIN     0x02
+            * PARTITION_INACTIVE  0x00
+
+    Returns:
+        (str): Partition state string
+    """
+    state = ""
+    if inx:
+        if inx == PARTITION_UP:
+            state = "UP"
+        elif inx == PARTITION_DOWN:
+            state = "DOWN"
+        elif inx == PARTITION_INACTIVE:
+            state = "INACTIVE"
+        elif inx == PARTITION_DRAIN:
+            state = "DRAIN"
+        else:
+            state = "UNKNOWN"
+
+    return state
+
+cdef inline object __get_partition_state(int inx, int extended=0):
+    """Returns a string that represents the state of the partition.
+
+    Args:
+        inx (int): Slurm partition type
+        extended (int): extended flag
+
+    Returns:
+        str: Partition state
+    """
+    cdef:
+        int drain_flag = (inx & 0x0200)
+        int comp_flag = (inx & 0x0400)
+        int no_resp_flag = (inx & 0x0800)
+        int power_flag = (inx & 0x1000)
+
+    inx = (inx & 0x00ff)
+
+    state = '?'
+
+    if (drain_flag):
+        if (comp_flag or (inx == 4)):
+            state = 'Draining'
+            if (no_resp_flag and extended):
+                state = 'Draining*'
+        else:
+            state = 'Drained'
+            if (no_resp_flag and extended):
+                state = 'Drained*'
+        return state
+
+    if (inx == 1):
+        state = 'Down'
+        if (no_resp_flag and extended):
+            state = 'Down*'
+    elif (inx == 3):
+        state = 'Allocated'
+        if (no_resp_flag and extended):
+            state = 'Allocated*'
+        elif (comp_flag and extended):
+            state = 'Allocated+'
+        elif (comp_flag):
+            state = 'Completing'
+            if (no_resp_flag and extended):
+                state = 'Completing*'
+    elif (inx == 2):
+        state = 'Idle'
+        if (no_resp_flag and extended):
+            state = 'Idle*'
+        elif (power_flag and extended):
+            state = 'Idle~'
+    elif (inx == 0):
+        state = 'Unknown'
+        if (no_resp_flag and extended):
+            state = 'Unknown*'
+
+    return "%s" % state
+
+
+def get_partition_mode(uint16_t flags=0, uint16_t max_share=0):
+    """Returns a string represents the state of the partition mode.
+
+    Args:
+        flags (int): Flags
+        max_share (int): Max share
+
+    Returns:
+        (dict): Partition mode dict
+    """
+    return __get_partition_mode(flags, max_share)
+
+cdef inline dict __get_partition_mode(uint16_t flags=0, uint16_t max_share=0):
+    cdef:
+        dict mode = {}
+        uint16_t force = max_share & SHARED_FORCE
+        uint16_t val = max_share & (~SHARED_FORCE)
+
+    if (flags & PART_FLAG_DEFAULT):
+        mode['Default'] = 1
+    else:
+        mode['Default'] = 0
+
+    if (flags & PART_FLAG_HIDDEN):
+        mode['Hidden'] = 1
+    else:
+        mode['Hidden'] = 0
+
+    if (flags & PART_FLAG_NO_ROOT):
+        mode['DisableRootJobs'] = 1
+    else:
+        mode['DisableRootJobs'] = 0
+
+    if (flags & PART_FLAG_ROOT_ONLY):
+        mode['RootOnly'] = 1
+    else:
+        mode['RootOnly'] = 0
+
+    if val == 0:
+        mode['Shared'] = "EXCLUSIVE"
+    elif force:
+        mode['Shared'] = "FORCED:" + str(val)
+    elif val == 1:
+        mode['Shared'] = "NO"
+    else:
+        mode['Shared'] = "YES:" + str(val)
+
+    if (flags & PART_FLAG_LLN):
+        mode['LLN'] = 1
+    else:
+        mode['LLN'] = 0
+
+    if (flags & PART_FLAG_EXCLUSIVE_USER):
+        mode['ExclusiveUser'] = 1
+    else:
+        mode['ExclusiveUser'] = 0
+
+    return mode
+
+
+def get_job_state(inx):
+    """Return the state of the slurm job state.
+
+    Args:
+        inx (int): Slurm job state
+            * JOB_PENDING     0
+            * JOB_RUNNING     1
+            * JOB_SUSPENDED   2
+            * JOB_COMPLETE    3
+            * JOB_CANCELLED   4
+            * JOB_FAILED      5
+            * JOB_TIMEOUT     6
+            * JOB_NODE_FAIL   7
+            * JOB_PREEMPTED   8
+            * JOB_BOOT_FAIL   10
+            * JOB_DEADLINE    11
+            * JOB_OOM         12
+            * JOB_END
+
+    Returns:
+        (str): Job state string
+    """
+    try:
+        job_state = stringOrNone(slurm.slurm_job_state_string(inx), '')
+        return job_state
+    except:
+        pass
+
+
+def get_job_state_reason(inx):
+    """Returns a reason why the slurm job is in a provided state.
+
+    Args:
+        inx (int): Slurm job state reason
+
+    Returns:
+        (str): Reason string
+    """
+    job_reason = stringOrNone(slurm.slurm_job_state_reason_string(inx), '')
+    return job_reason
+
+
+def epoch2date(epochSecs):
+    """Convert epoch secs to a python time string.
+
+    Args:
+        epochSecs (int): Seconds since epoch
+
+    Returns:
+        (str): Date str
+    """
+    try:
+        dateTime = p_time.gmtime(epochSecs)
+        return "%s" % p_time.strftime("%a %b %d %H:%M:%S %Y", dateTime)
+    except:
+        pass
+
+
+def __convertDefaultTime(uint32_t inx):
+    try:
+        if inx == 0xffffffff:
+            return 'infinite'
+        elif inx == 0xfffffffe:
+            return 'no_value'
+        else:
+            return '%s' % inx
+    except:
+        pass
+
+
+class Dict(defaultdict):
+
+    def __init__(self):
+        defaultdict.__init__(self, Dict)
+
+    def __repr__(self):
+        return dict.__repr__(self)
+
+
+#
+# Slurm Controller License Class
+#
+
+
+cdef class licenses:
+    """Access slurm controller license information."""
+
+    cdef:
+        slurm.license_info_msg_t *_msg
+        slurm.time_t _lastUpdate
+        uint16_t _ShowFlags
+        dict _licDict
+
+    def __cinit__(self):
+        self._msg = NULL
+        self._ShowFlags = slurm.SHOW_ALL
+        self._lastUpdate = <time_t> NULL
+
+    def __dealloc__(self):
+        """Free the memory allocated by load licenses method."""
+        pass
+
+    def lastUpdate(self):
+        """Return last time (epoch seconds) license data was updated.
+
+        Returns:
+            (int): Epoch seconds
+        """
+        return self._lastUpdate
+
+    def ids(self):
+        """Return the current license names from retrieved license data.
+
+        This method calls slurm_load_licenses to retrieve license information
+        from the controller.  slurm_free_license_info_msg is used to free the
+        license message buffer.
+
+        Returns:
+            (dict): Dictionary of licenses
+        """
+        cdef:
+            int rc
+            int apiError
+            uint32_t i
+            list all_licenses
+
+        rc = slurm.slurm_load_licenses(<time_t> NULL, &self._msg,
+                                       self._ShowFlags)
+
+        if rc == slurm.SLURM_SUCCESS:
+            all_licenses = []
+            self._lastUpdate = self._msg.last_update
+
+            for i in range(self._msg.num_lic):
+                all_licenses.append(self._msg.lic_array[i].name)
+            slurm.slurm_free_license_info_msg(self._msg)
+            self._msg = NULL
+            return all_licenses
+        else:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
+
+    def get(self):
+        """Get full license information from the slurm controller.
+
+        This method calls slurm_load_licenses to retrieve license information
+        from the controller.  slurm_free_license_info_msg is used to free the
+        license message buffer.
+
+        Returns:
+            (dict): Dictionary whose key is the license name
+        """
+        cdef:
+            int rc
+            int apiError
+            dict License_dict
+
+        rc = slurm.slurm_load_licenses(<time_t> NULL, &self._msg,
+                                       self._ShowFlags)
+
+        if rc == slurm.SLURM_SUCCESS:
+            self._licDict = {}
+            self._lastUpdate = self._msg.last_update
+
+            for record in self._msg.lic_array[:self._msg.num_lic]:
+                License_dict = {}
+                license_name = stringOrNone(record.name, '')
+                License_dict["total"] = record.total
+                License_dict["in_use"] = record.in_use
+                License_dict["available"] = record.available
+                License_dict["remote"] = record.remote
+                self._licDict[license_name] = License_dict
+            slurm.slurm_free_license_info_msg(self._msg)
+            self._msg = NULL
+            return self._licDict
+        else:
+            apiError = slurm_get_errno()
+            raise ValueError(stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)

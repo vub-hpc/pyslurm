@@ -27,6 +27,7 @@ from libc.string cimport memcpy, memset
 from pyslurm cimport slurm
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t
 from pyslurm.slurm cimport (
+    list_t,
     partition_info_msg_t,
     job_defaults_t,
     delete_part_msg_t,
@@ -55,7 +56,6 @@ from pyslurm.utils cimport cstr
 from pyslurm.utils cimport ctime
 from pyslurm.utils.ctime cimport time_t
 from pyslurm.utils.uint cimport *
-from pyslurm.core cimport slurmctld
 from pyslurm.xcollections cimport MultiClusterMap
 
 
@@ -63,7 +63,7 @@ cdef class Partitions(MultiClusterMap):
     """A [`Multi Cluster`][pyslurm.xcollections.MultiClusterMap] collection of [pyslurm.Partition][] objects.
 
     Args:
-        partitions (Union[list[str], dict[str, Partition], str], optional=None):
+        partitions (Union[list[str], dict[str, pyslurm.Partition], str], optional=None):
             Partitions to initialize this collection with.
 
     Attributes:
@@ -217,7 +217,7 @@ cdef class Partition:
     cdef:
         partition_info_t *ptr
         int power_save_enabled
-        slurmctld.Config slurm_conf
+        slurm_conf
 
     cdef readonly cluster
 

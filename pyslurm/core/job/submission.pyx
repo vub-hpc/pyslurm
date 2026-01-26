@@ -83,7 +83,7 @@ cdef class JobSubmitDescription:
             (int): The ID of the submitted Job.
 
         Raises:
-            RPCError: When the job submission was not successful.
+            (pyslurm.RPCError): When the job submission was not successful.
 
         Examples:
             >>> import pyslurm
@@ -102,7 +102,7 @@ cdef class JobSubmitDescription:
         self._create_job_submit_desc()
         verify_rpc(slurm_submit_batch_job(self.ptr, &resp))
 
-        job_id = resp.job_id
+        job_id = resp.step_id.job_id
         slurm_free_submit_response_response_msg(resp)
 
         return job_id
@@ -168,7 +168,7 @@ cdef class JobSubmitDescription:
                 continue
 
             spec = attr.upper()
-            val = pyenviron.get(f"PYSLURM_JOBDESC_{spec)}")
+            val = pyenviron.get(f"PYSLURM_JOBDESC_{spec}")
             if (val is not None
                     and (getattr(self, attr) is None or overwrite)):
 
