@@ -9,7 +9,7 @@
 # * C-Macros are listed with their appropriate uint type
 # * Any definitions that cannot be translated are not included in this file
 #
-# Generated on 2024-07-12T16:21:51.735507
+# Generated on 2025-09-28T15:03:23.665186
 #
 # The Original Copyright notice from slurm_errno.h has been included
 # below:
@@ -72,6 +72,9 @@ cdef extern from "slurm/slurm_errno.h":
         SLURM_PLUGIN_NAME_INVALID
         SLURM_UNKNOWN_FORWARD_ADDR
         SLURM_COMMUNICATIONS_MISSING_SOCKET_ERROR
+        SLURM_COMMUNICATIONS_INVALID_INCOMING_FD
+        SLURM_COMMUNICATIONS_INVALID_OUTGOING_FD
+        SLURM_COMMUNICATIONS_INVALID_FD
         SLURMCTLD_COMMUNICATIONS_CONNECTION_ERROR
         SLURMCTLD_COMMUNICATIONS_SEND_ERROR
         SLURMCTLD_COMMUNICATIONS_RECEIVE_ERROR
@@ -180,7 +183,6 @@ cdef extern from "slurm/slurm_errno.h":
         ESLURM_BURST_BUFFER_WAIT
         ESLURM_PARTITION_DOWN
         ESLURM_DUPLICATE_GRES
-        ESLURM_JOB_SETTING_DB_INX
         ESLURM_RSV_ALREADY_STARTED
         ESLURM_SUBMISSIONS_DISABLED
         ESLURM_NOT_HET_JOB
@@ -255,6 +257,8 @@ cdef extern from "slurm/slurm_errno.h":
         ESLURM_RES_CORES_PER_GPU_TOPO
         ESLURM_RES_CORES_PER_GPU_NO
         ESLURM_MAX_POWERED_NODES
+        ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE
+        ESLURM_PREEMPTION_REQUIRED
         ESPANK_ERROR
         ESPANK_BAD_ARG
         ESPANK_NOT_TASK
@@ -266,6 +270,8 @@ cdef extern from "slurm/slurm_errno.h":
         ESPANK_NOT_EXECD
         ESPANK_NOT_AVAIL
         ESPANK_NOT_LOCAL
+        ESPANK_NODE_FAILURE
+        ESPANK_JOB_FAILURE
         ESLURMD_KILL_TASK_FAILED
         ESLURMD_KILL_JOB_ALREADY_COMPLETE
         ESLURMD_INVALID_ACCT_FREQ
@@ -282,7 +288,7 @@ cdef extern from "slurm/slurm_errno.h":
         ESLURMD_EPILOG_FAILED
         ESLURMD_TOOMANYSTEPS
         ESLURMD_STEP_EXISTS
-        ESLURMD_JOB_NOTRUNNING
+        ESLURMD_STEP_NOTRUNNING
         ESLURMD_STEP_SUSPENDED
         ESLURMD_STEP_NOTSUSPENDED
         ESLURMD_INVALID_SOCKET_NAME_LEN
@@ -290,10 +296,12 @@ cdef extern from "slurm/slurm_errno.h":
         ESLURMD_CPU_BIND_ERROR
         ESLURMD_CPU_LAYOUT_ERROR
         ESLURMD_TOO_MANY_RPCS
+        ESLURMD_STEPD_PROXY_FAILED
         ESLURM_PROTOCOL_INCOMPLETE_PACKET
         SLURM_PROTOCOL_SOCKET_IMPL_TIMEOUT
         SLURM_PROTOCOL_SOCKET_ZERO_BYTES_SENT
         ESLURM_AUTH_CRED_INVALID
+        ESLURM_AUTH_EXPIRED
         ESLURM_AUTH_BADARG
         ESLURM_AUTH_UNPACK
         ESLURM_AUTH_SKIP
@@ -311,6 +319,7 @@ cdef extern from "slurm/slurm_errno.h":
         ESLURM_BAD_SQL
         ESLURM_NO_REMOVE_DEFAULT_QOS
         ESLURM_COORD_NO_INCREASE_JOB_LIMIT
+        ESLURM_NO_RPC_STATS
         ESLURM_FED_CLUSTER_MAX_CNT
         ESLURM_FED_CLUSTER_MULTIPLE_ASSIGNMENT
         ESLURM_INVALID_CLUSTER_FEATURE
@@ -352,6 +361,8 @@ cdef extern from "slurm/slurm_errno.h":
         ESLURM_DATA_PARSING_DEPTH
         ESLURM_DATA_PARSER_INVALID_STATE
         ESLURM_CONTAINER_NOT_CONFIGURED
+        ESLURM_URL_UNKNOWN_SCHEME
+        ESLURM_URL_EMPTY
 
     ctypedef struct slurm_errtab_t:
         int xe_number
@@ -365,7 +376,5 @@ cdef extern from "slurm/slurm_errno.h":
     char* slurm_strerror(int errnum)
 
     void slurm_seterrno(int errnum)
-
-    int slurm_get_errno()
 
     void slurm_perror(const char* msg)
