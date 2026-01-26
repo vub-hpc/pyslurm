@@ -1,7 +1,7 @@
 %global slurm_version 25.11
 %global slurm_patch 2
-%global commit 9a7885376717c5aeb8a37436dc0f11f81a14f039
-%global snapshot 1.git9a7885
+%global commit bb471262f3a57fb74d1f7deb7c13ec186226b7c8
+%global snapshot 1.gitbb4712
 
 Name:           python-pyslurm
 Version:        %{slurm_version}.0^%{snapshot}
