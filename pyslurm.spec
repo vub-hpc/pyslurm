@@ -55,11 +55,9 @@ Summary:        %{summary}
 # Testing disabled
 # PySlurm needs a working Slurm environment
 
-%files -n python3-pyslurm
+%files -n python3-pyslurm -f %{pyproject_files}
 %license COPYING.txt
-%doc README.md
-%{python3_sitearch}/pyslurm-*.egg-info/
-%{python3_sitearch}/pyslurm/
+%doc README.md{python3_sitearch}/pyslurm/
 
 %changelog
 * Mon Jan 26 2026 Alex Domingo <alex.domingo.toro@vub.be>
