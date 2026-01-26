@@ -57,7 +57,7 @@ Summary:        %{summary}
 
 %files -n python3-pyslurm -f %{pyproject_files}
 %license COPYING.txt
-%doc README.md{python3_sitearch}/pyslurm/
+%doc README.md
 
 %changelog
 * Mon Jan 26 2026 Alex Domingo <alex.domingo.toro@vub.be>
